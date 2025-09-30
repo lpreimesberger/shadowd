@@ -143,6 +143,85 @@ curl "http://localhost:8080/api/balance?address=a8b033b8fde716ee1234567890abcdef
 - All amounts are in the smallest unit (8 decimal places for SHADOW)
 - `5000000000` = 50.00000000 SHADOW tokens
 
+### Get Address Transactions
+Returns paginated transaction history for an address.
+
+**Endpoint:** `GET /api/transactions`
+
+**Query Parameters:**
+- `address` (optional): The address to query. If not provided, uses the node's wallet address.
+- `count` (optional): Number of transactions to return. Default: 32. Must be > 0.
+- `after` (optional): Transaction ID to paginate from. Returns transactions after this ID. If not provided, returns the latest transactions.
+
+**Example:**
+```bash
+# Get latest 10 transactions
+curl "http://localhost:8080/api/transactions?count=10"
+
+# Get next page after a specific transaction
+curl "http://localhost:8080/api/transactions?count=10&after=abc123def456..."
+
+# Get transactions for a specific address
+curl "http://localhost:8080/api/transactions?address=a8b033b8fde716ee1234567890abcdef12345678&count=20"
+```
+
+**Response:**
+```json
+{
+  "address": "a8b033b8fde716ee1234567890abcdef12345678",
+  "transactions": [
+    {
+      "tx_id": "abc123def456...",
+      "tx_type": 0,
+      "timestamp": 1727632770,
+      "inputs": [],
+      "outputs": [
+        {
+          "address": "a8b033b8fde716ee1234567890abcdef12345678",
+          "amount": 5000000000,
+          "token_id": "a1b2c3d4e5f6...",
+          "token_type": "native"
+        }
+      ]
+    },
+    {
+      "tx_id": "def789abc123...",
+      "tx_type": 1,
+      "timestamp": 1727632800,
+      "inputs": [
+        {
+          "prev_tx_id": "abc123def456...",
+          "output_index": 0,
+          "sequence": 4294967295
+        }
+      ],
+      "outputs": [
+        {
+          "address": "b9c144c9fed827ff2345678901bcdef123456789",
+          "amount": 1000000000,
+          "token_id": "a1b2c3d4e5f6...",
+          "token_type": "native"
+        }
+      ]
+    }
+  ],
+  "count": 2
+}
+```
+
+**Response Fields:**
+- `address`: The queried address
+- `transactions`: Array of transaction objects
+  - `tx_id`: Unique transaction identifier
+  - `tx_type`: Transaction type (0=Coinbase, 1=Send, 2=Mint, 3=Melt)
+  - `timestamp`: Unix timestamp
+  - `inputs`: Array of transaction inputs (empty for coinbase transactions)
+  - `outputs`: Array of transaction outputs with addresses, amounts, and token info
+- `count`: Number of transactions returned
+
+**Pagination:**
+To paginate through results, use the `tx_id` of the last transaction in the current page as the `after` parameter for the next request.
+
 ### Get Address UTXOs
 Returns all unspent transaction outputs (UTXOs) for an address.
 

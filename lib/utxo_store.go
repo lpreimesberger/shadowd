@@ -17,10 +17,13 @@ type UTXOStore struct {
 
 // Prefixes for different data types in the database
 const (
-	UTXOPrefix    = "utxo:"   // utxo:{txid}:{index} -> UTXO
-	AddressPrefix = "addr:"   // addr:{address}:{txid}:{index} -> ""
-	HeightPrefix  = "height:" // height:{height}:{txid}:{index} -> ""
-	SpentPrefix   = "spent:"  // spent:{txid}:{index} -> ""
+	UTXOPrefix       = "utxo:"    // utxo:{txid}:{index} -> UTXO
+	AddressPrefix    = "addr:"    // addr:{address}:{txid}:{index} -> ""
+	HeightPrefix     = "height:"  // height:{height}:{txid}:{index} -> ""
+	SpentPrefix      = "spent:"   // spent:{txid}:{index} -> ""
+	TxPrefix         = "tx:"      // tx:{txid} -> Transaction
+	AddrTxPrefix     = "addrtx:"  // addrtx:{address}:{height}:{txid} -> ""
+	AddrTxIndexCount = "atxcnt:"  // atxcnt:{address} -> count
 )
 
 // NewUTXOStore creates a new UTXO store with the given database
@@ -288,4 +291,185 @@ func (store *UTXOStore) Close() error {
 		return store.db.Close()
 	}
 	return nil
+}
+
+// StoreTransaction stores a transaction and indexes it by addresses involved
+func (store *UTXOStore) StoreTransaction(tx *Transaction, height int64) error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+
+	txID, err := tx.CalculateHash()
+	if err != nil {
+		return fmt.Errorf("failed to calculate transaction hash: %w", err)
+	}
+
+	// Store transaction
+	txKey := fmt.Sprintf("%s%s", TxPrefix, txID)
+	txData, err := json.Marshal(tx)
+	if err != nil {
+		return fmt.Errorf("failed to marshal transaction: %w", err)
+	}
+
+	if err := store.db.Set([]byte(txKey), txData); err != nil {
+		return fmt.Errorf("failed to store transaction: %w", err)
+	}
+
+	// Index by addresses involved (both inputs and outputs)
+	addressMap := make(map[string]bool)
+
+	// Collect addresses from outputs
+	for _, output := range tx.Outputs {
+		addressMap[output.Address.String()] = true
+	}
+
+	// Collect addresses from inputs (via UTXOs)
+	for _, input := range tx.Inputs {
+		utxo, _ := store.GetUTXO(input.PrevTxID, input.OutputIndex)
+		if utxo != nil {
+			addressMap[utxo.Output.Address.String()] = true
+		}
+	}
+
+	// Create address-tx index for each address
+	// Format: addrtx:{address}:{height}:{txid}
+	// Using negative height for reverse chronological order
+	for addrStr := range addressMap {
+		addrTxKey := fmt.Sprintf("%s%s:%020d:%s", AddrTxPrefix, addrStr, 9999999999999999999-height, txID)
+		if err := store.db.Set([]byte(addrTxKey), []byte("")); err != nil {
+			return fmt.Errorf("failed to store address-tx index: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// GetTransaction retrieves a transaction by its ID
+func (store *UTXOStore) GetTransaction(txID string) (*Transaction, error) {
+	store.mutex.RLock()
+	defer store.mutex.RUnlock()
+
+	txKey := fmt.Sprintf("%s%s", TxPrefix, txID)
+	data, err := store.db.Get([]byte(txKey))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get transaction: %w", err)
+	}
+	if data == nil {
+		return nil, nil
+	}
+
+	var tx Transaction
+	if err := json.Unmarshal(data, &tx); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal transaction: %w", err)
+	}
+
+	return &tx, nil
+}
+
+// GetTransactionsByAddress returns transactions for an address with pagination
+func (store *UTXOStore) GetTransactionsByAddress(address Address, count int, afterTxID string) ([]*Transaction, error) {
+	store.mutex.RLock()
+	defer store.mutex.RUnlock()
+
+	if count <= 0 {
+		count = 32
+	}
+
+	var transactions []*Transaction
+	prefix := fmt.Sprintf("%s%s:", AddrTxPrefix, address.String())
+
+	// If afterTxID is provided, we need to start from that point
+	var startKey []byte
+	if afterTxID != "" {
+		// Find the key for afterTxID to determine where to start
+		iterator, err := store.db.Iterator([]byte(prefix), nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create iterator: %w", err)
+		}
+		defer iterator.Close()
+
+		found := false
+		for ; iterator.Valid(); iterator.Next() {
+			key := string(iterator.Key())
+			if len(key) <= len(prefix) {
+				continue
+			}
+			// Extract txID from key format: addrtx:{address}:{height}:{txid}
+			parts := key[len(prefix):]
+			lastColon := -1
+			for i := len(parts) - 1; i >= 0; i-- {
+				if parts[i] == ':' {
+					lastColon = i
+					break
+				}
+			}
+			if lastColon == -1 {
+				continue
+			}
+			txID := parts[lastColon+1:]
+			if txID == afterTxID {
+				found = true
+				// Move to next item
+				iterator.Next()
+				if iterator.Valid() {
+					startKey = iterator.Key()
+				}
+				break
+			}
+		}
+		if !found {
+			return transactions, nil // afterTxID not found, return empty
+		}
+	} else {
+		startKey = []byte(prefix)
+	}
+
+	// Iterate from startKey
+	iterator, err := store.db.Iterator(startKey, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create iterator: %w", err)
+	}
+	defer iterator.Close()
+
+	collected := 0
+	for ; iterator.Valid() && collected < count; iterator.Next() {
+		key := string(iterator.Key())
+		if len(key) <= len(prefix) {
+			continue
+		}
+		// Check if key still has our prefix
+		if !startsWithPrefix(key, prefix) {
+			break
+		}
+
+		// Extract txID from key format: addrtx:{address}:{height}:{txid}
+		parts := key[len(prefix):]
+		lastColon := -1
+		for i := len(parts) - 1; i >= 0; i-- {
+			if parts[i] == ':' {
+				lastColon = i
+				break
+			}
+		}
+		if lastColon == -1 {
+			continue
+		}
+		txID := parts[lastColon+1:]
+
+		// Get the transaction
+		tx, err := store.GetTransaction(txID)
+		if err != nil {
+			continue // Skip errored transactions
+		}
+		if tx != nil {
+			transactions = append(transactions, tx)
+			collected++
+		}
+	}
+
+	return transactions, nil
+}
+
+// Helper function to check prefix
+func startsWithPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }

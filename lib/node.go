@@ -184,6 +184,7 @@ func (ns *NodeServer) startHTTPServer() error {
 	// Transaction API endpoints
 	mux.HandleFunc("/api/transactions/send", ns.handleSendTransaction)
 	mux.HandleFunc("/api/transactions/submit", ns.handleSubmitTransaction)
+	mux.HandleFunc("/api/transactions", ns.handleGetTransactions)
 
 	// UTXO and balance endpoints
 	mux.HandleFunc("/api/utxos", ns.handleGetUTXOs)
@@ -713,6 +714,99 @@ func (ns *NodeServer) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 	response := map[string]interface{}{
 		"address":  addressStr,
 		"balances": balanceArray,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// handleGetTransactions returns paginated transactions for a given address
+func (ns *NodeServer) handleGetTransactions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	addressStr := r.URL.Query().Get("address")
+	if addressStr == "" {
+		// Default to node's own address
+		addressStr = ns.nodeWallet.GetAddressString()
+	}
+
+	address, _, err := ParseAddress(addressStr)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid address: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Parse count parameter (default 32)
+	count := 32
+	if countStr := r.URL.Query().Get("count"); countStr != "" {
+		parsedCount, err := strconv.Atoi(countStr)
+		if err != nil || parsedCount <= 0 {
+			http.Error(w, "Invalid count parameter", http.StatusBadRequest)
+			return
+		}
+		count = parsedCount
+	}
+
+	// Parse after parameter (optional)
+	afterTxID := r.URL.Query().Get("after")
+
+	// Get UTXO store from Tendermint app
+	if ns.tendermint == nil || ns.tendermint.app == nil {
+		http.Error(w, "Node not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Get transactions from UTXO store
+	transactions, err := ns.tendermint.app.utxoStore.GetTransactionsByAddress(address, count, afterTxID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get transactions: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Build response with all useful transaction info
+	txResponses := make([]map[string]interface{}, 0, len(transactions))
+	for _, tx := range transactions {
+		txID, _ := tx.ID()
+
+		// Build inputs info
+		inputs := make([]map[string]interface{}, len(tx.Inputs))
+		for i, input := range tx.Inputs {
+			inputs[i] = map[string]interface{}{
+				"prev_tx_id":     input.PrevTxID,
+				"output_index":   input.OutputIndex,
+				"sequence":       input.Sequence,
+			}
+		}
+
+		// Build outputs info
+		outputs := make([]map[string]interface{}, len(tx.Outputs))
+		for i, output := range tx.Outputs {
+			outputs[i] = map[string]interface{}{
+				"address":   output.Address.String(),
+				"amount":    output.Amount,
+				"token_id":  output.TokenID,
+				"token_type": output.TokenType,
+			}
+		}
+
+		txResponse := map[string]interface{}{
+			"tx_id":     txID,
+			"tx_type":   tx.TxType,
+			"timestamp": tx.Timestamp,
+			"inputs":    inputs,
+			"outputs":   outputs,
+		}
+
+		txResponses = append(txResponses, txResponse)
+	}
+
+	response := map[string]interface{}{
+		"address":      addressStr,
+		"transactions": txResponses,
+		"count":        len(txResponses),
 	}
 
 	w.Header().Set("Content-Type", "application/json")

@@ -767,6 +767,11 @@ func executeTransaction(tx *Transaction, blockHeight int64, utxoStore *UTXOStore
 				return fmt.Errorf("failed to add UTXO %s:%d: %w", txID, i, err)
 			}
 		}
+
+		// Store the transaction
+		if err := utxoStore.StoreTransaction(tx, blockHeight); err != nil {
+			return fmt.Errorf("failed to store transaction: %w", err)
+		}
 	}
 
 	return nil
