@@ -1,0 +1,7 @@
+/plots/
+/node_key.json
+/node_id.txt
+*.sh
+shadowy*
+/data/
+/blockchain/
