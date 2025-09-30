@@ -164,8 +164,11 @@ func (store *UTXOStore) GetUTXOsByAddress(address Address) ([]*UTXO, error) {
 		var outputIndex uint32
 
 		// Key format: addr:{address}:{txid}:{index}
-		parts := len(prefix)
-		remainingKey := key[parts:]
+		prefixLen := len(prefix)
+		if len(key) <= prefixLen {
+			continue // Skip malformed keys
+		}
+		remainingKey := key[prefixLen:]
 
 		// Find the last colon to separate txID and index
 		lastColon := -1

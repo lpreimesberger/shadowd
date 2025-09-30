@@ -117,13 +117,27 @@ curl "http://localhost:8080/api/balance?address=a8b033b8fde716ee1234567890abcdef
 ```json
 {
   "address": "a8b033b8fde716ee1234567890abcdef12345678",
-  "balances": {
-    "SHADOW": 5000000000,
-    "CUSTOM_TOKEN": 1000000
-  },
-  "total_utxos": 3
+  "balances": [
+    {
+      "token_id": "a1b2c3d4e5f6...",
+      "name": "Shadow",
+      "balance": 5000000000
+    },
+    {
+      "token_id": "f6e5d4c3b2a1...",
+      "name": "Custom Token",
+      "balance": 1000000
+    }
+  ]
 }
 ```
+
+**Response Fields:**
+- `address`: The queried address
+- `balances`: Array of token balances
+  - `token_id`: The unique hash identifier for the token
+  - `name`: Token name ("Shadow" for SHADOW base currency, or custom name for minted tokens)
+  - `balance`: Amount in smallest units (8 decimal places)
 
 **Balance Format:**
 - All amounts are in the smallest unit (8 decimal places for SHADOW)

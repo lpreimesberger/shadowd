@@ -697,17 +697,22 @@ func (ns *NodeServer) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get UTXOs for count
-	utxos, err := ns.tendermint.app.utxoStore.GetUTXOsByAddress(address)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to get UTXOs: %v", err), http.StatusInternalServerError)
-		return
+	// Get genesis token for base currency
+	genesisToken := GetGenesisToken()
+
+	// Build balance array with only base currency for now
+	balanceArray := []map[string]interface{}{}
+	if amount, exists := balances[genesisToken.TokenID]; exists {
+		balanceArray = append(balanceArray, map[string]interface{}{
+			"token_id": genesisToken.TokenID,
+			"name":     genesisToken.Name,
+			"balance":  amount,
+		})
 	}
 
 	response := map[string]interface{}{
-		"address":     addressStr,
-		"balances":    balances,
-		"total_utxos": len(utxos),
+		"address":  addressStr,
+		"balances": balanceArray,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
