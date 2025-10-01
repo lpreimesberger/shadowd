@@ -17,6 +17,119 @@ Currently, no authentication is required for API endpoints.
 
 ---
 
+## Address Format and Validation
+
+Shadowy uses a robust address format with multiple layers of validation to prevent errors and improve usability.
+
+### Address Structure
+
+Addresses consist of 66 characters with the following format:
+```
+[TYPE_PREFIX][64_HEX_CHARS][LUHN_CHECKSUM]
+```
+
+**Components:**
+1. **Type Prefix** (1 char): Indicates address type
+   - `S` - Standard wallet addresses (most common)
+   - `L` - Liquidity pool addresses
+   - `X` - Exchange/swap addresses
+   - `N` - NFT/special purpose addresses
+
+2. **Hex Portion** (64 chars): 32-byte address hash encoded as hexadecimal
+   - Derived from BLAKE2b-256 hash of ML-DSA-87 public key
+   - Uses EIP-55 style mixed-case checksum (optional but recommended)
+
+3. **Luhn Checksum** (1 char): Final validation character
+   - Calculated on normalized (lowercase) address
+   - Mandatory for all addresses
+
+### Example Valid Addresses
+
+```
+SBBB69aaa4a1537de49FEFde036b2f55809d2B868797B2fD20E7811203E233D3d4
+│└────────────────────────────────────────────────────────────────┘│
+│                    64 hex chars (with EIP-55 checksum)             │
+│                                                                   Luhn
+Type (S = Standard wallet)
+```
+
+### Validation Rules
+
+Clients should validate addresses **before** submitting to the API to avoid rejected transactions:
+
+1. **Length Check**: Must be exactly 66 characters
+2. **Type Prefix**: First character must be `S`, `L`, `X`, or `N`
+3. **Hex Validation**: Characters 2-65 must be valid hexadecimal (0-9, a-f, A-F)
+4. **Luhn Checksum**: Last character must match calculated Luhn checksum
+5. **EIP-55 Checksum** (optional): If mixed case is used, it must be correct
+
+### Client-Side Validation
+
+**JavaScript Example:**
+```javascript
+function validateAddress(addr) {
+  // Length check
+  if (addr.length !== 66) return false;
+
+  // Type prefix check
+  const validTypes = ['S', 'L', 'X', 'N'];
+  if (!validTypes.includes(addr[0])) return false;
+
+  // Hex portion check
+  const hexPortion = addr.substring(1, 65);
+  if (!/^[0-9a-fA-F]{64}$/.test(hexPortion)) return false;
+
+  // Luhn checksum validation (implement calculateLuhn function)
+  const normalized = addr.substring(0, 65).toLowerCase();
+  const expectedLuhn = calculateLuhn(normalized);
+  if (addr[65] !== expectedLuhn) return false;
+
+  return true;
+}
+```
+
+**Python Example:**
+```python
+def validate_address(addr: str) -> bool:
+    # Length check
+    if len(addr) != 66:
+        return False
+
+    # Type prefix check
+    if addr[0] not in ['S', 'L', 'X', 'N']:
+        return False
+
+    # Hex portion check
+    hex_portion = addr[1:65]
+    try:
+        int(hex_portion, 16)
+    except ValueError:
+        return False
+
+    # Luhn checksum validation
+    normalized = addr[:65].lower()
+    expected_luhn = calculate_luhn(normalized)
+    return addr[65] == expected_luhn
+```
+
+### Common Validation Errors
+
+- `"address too short"` - Address must be exactly 66 characters
+- `"invalid address type prefix"` - First character must be S, L, X, or N
+- `"invalid Luhn checksum"` - Final checksum character is incorrect
+- `"invalid EIP-55 checksum"` - Mixed case is used but incorrect
+- `"address must be 32 bytes"` - Hex portion doesn't decode to 32 bytes
+
+### Best Practices
+
+1. **Always validate addresses client-side** before API submission
+2. **Display addresses with mixed case** to enable EIP-55 validation
+3. **Use copy-paste** for addresses to avoid transcription errors
+4. **Implement QR codes** for mobile/cross-device address sharing
+5. **Show clear error messages** indicating which validation failed
+
+---
+
 ## Node Information
 
 ### Get Node Status
@@ -31,7 +144,7 @@ Returns comprehensive information about the node's current state.
   "node_id": "c1664df26a9bdf2e5b14f88ebacd6e12e42a761e",
   "seed_connect_string": "c1664df26a9bdf2e5b14f88ebacd6e12e42a761e@127.0.0.1:26666",
   "wallet_info": {
-    "address": "a8b033b8fde716ee...",
+    "address": "SA8b033b8fDe716eE1234567890aBcdEF12345678901234567890aBcdEf123456a",
     "public_key": "...",
     "created_at": "2025-09-29T16:39:30Z"
   },
@@ -76,7 +189,7 @@ Returns information about the node's wallet.
 **Response:**
 ```json
 {
-  "address": "a8b033b8fde716ee1234567890abcdef12345678",
+  "address": "SA8b033b8fDe716eE1234567890aBcdEF12345678901234567890aBcdEf123456a",
   "public_key": "034f0764fb8cc5c2d7b5c8f5e3a8b7c6d9e2f1a0...",
   "created_at": "2025-09-29T16:39:30Z"
 }
@@ -110,13 +223,13 @@ Returns the current balance for any address by querying the UTXO set.
 
 **Example:**
 ```bash
-curl "http://localhost:8080/api/balance?address=a8b033b8fde716ee1234567890abcdef12345678"
+curl "http://localhost:8080/api/balance?address=SA8b033b8fDe716eE1234567890aBcdEF12345678901234567890aBcdEf123456a"
 ```
 
 **Response:**
 ```json
 {
-  "address": "a8b033b8fde716ee1234567890abcdef12345678",
+  "address": "SA8b033b8fDe716eE1234567890aBcdEF12345678901234567890aBcdEf123456a",
   "balances": [
     {
       "token_id": "a1b2c3d4e5f6...",
@@ -162,13 +275,13 @@ curl "http://localhost:8080/api/transactions?count=10"
 curl "http://localhost:8080/api/transactions?count=10&after=abc123def456..."
 
 # Get transactions for a specific address
-curl "http://localhost:8080/api/transactions?address=a8b033b8fde716ee1234567890abcdef12345678&count=20"
+curl "http://localhost:8080/api/transactions?address=SA8b033b8fDe716eE1234567890aBcdEF12345678901234567890aBcdEf123456a&count=20"
 ```
 
 **Response:**
 ```json
 {
-  "address": "a8b033b8fde716ee1234567890abcdef12345678",
+  "address": "SA8b033b8fDe716eE1234567890aBcdEF12345678901234567890aBcdEf123456a",
   "transactions": [
     {
       "tx_id": "abc123def456...",
@@ -177,7 +290,7 @@ curl "http://localhost:8080/api/transactions?address=a8b033b8fde716ee1234567890a
       "inputs": [],
       "outputs": [
         {
-          "address": "a8b033b8fde716ee1234567890abcdef12345678",
+          "address": "SA8b033b8fDe716eE1234567890aBcdEF12345678901234567890aBcdEf123456a",
           "amount": 5000000000,
           "token_id": "a1b2c3d4e5f6...",
           "token_type": "native"
@@ -197,7 +310,7 @@ curl "http://localhost:8080/api/transactions?address=a8b033b8fde716ee1234567890a
       ],
       "outputs": [
         {
-          "address": "b9c144c9fed827ff2345678901bcdef123456789",
+          "address": "SB9c144C9Fed827fF2345678901BcdEF12345678901234567890bCdEf123456b",
           "amount": 1000000000,
           "token_id": "a1b2c3d4e5f6...",
           "token_type": "native"
@@ -232,20 +345,20 @@ Returns all unspent transaction outputs (UTXOs) for an address.
 
 **Example:**
 ```bash
-curl "http://localhost:8080/api/utxos?address=a8b033b8fde716ee1234567890abcdef12345678"
+curl "http://localhost:8080/api/utxos?address=SA8b033b8fDe716eE1234567890aBcdEF12345678901234567890aBcdEf123456a"
 ```
 
 **Response:**
 ```json
 {
-  "address": "a8b033b8fde716ee1234567890abcdef12345678",
+  "address": "SA8b033b8fDe716eE1234567890aBcdEF12345678901234567890aBcdEf123456a",
   "utxos": [
     {
       "tx_id": "abc123def456...",
       "output_index": 0,
       "amount": 5000000000,
       "token_id": "SHADOW",
-      "address": "a8b033b8fde716ee1234567890abcdef12345678",
+      "address": "SA8b033b8fDe716eE1234567890aBcdEF12345678901234567890aBcdEf123456a",
       "block_height": 42,
       "is_spent": false
     }
@@ -266,7 +379,7 @@ Creates, signs, and submits a simple send transaction.
 **Request Body:**
 ```json
 {
-  "to_address": "b9c144c9fed827ff2345678901bcdef123456789",
+  "to_address": "SB9c144C9Fed827fF2345678901BcdEF12345678901234567890bCdEf123456b",
   "amount": 1000000000,
   "token_id": "ee5ccf1bab2fa5ce60bbaec533faf8332a637045b5c6d47803dce25e1591b626",
   "fee": 1000,
@@ -287,7 +400,7 @@ Creates, signs, and submits a simple send transaction.
 curl -X POST http://localhost:8080/api/transactions/send \
   -H "Content-Type: application/json" \
   -d '{
-    "to_address": "b9c144c9fed827ff2345678901bcdef123456789",
+    "to_address": "SB9c144C9Fed827fF2345678901BcdEF12345678901234567890bCdEf123456b",
     "amount": 1000000000,
     "fee": 1000
   }'
@@ -296,7 +409,7 @@ curl -X POST http://localhost:8080/api/transactions/send \
 curl -X POST http://localhost:8080/api/transactions/send \
   -H "Content-Type: application/json" \
   -d '{
-    "to_address": "b9c144c9fed827ff2345678901bcdef123456789",
+    "to_address": "SB9c144C9Fed827fF2345678901BcdEF12345678901234567890bCdEf123456b",
     "amount": 500000000,
     "token_id": "f6e5d4c3b2a1...",
     "fee": 2000,
@@ -345,7 +458,7 @@ Submits a pre-signed transaction to the mempool.
     "outputs": [
       {
         "amount": 1000000000,
-        "address": "b9c144c9fed827ff...",
+        "address": "SB9c144C9Fed827fF2345678901BcdEF12345678901234567890bCdEf123456b",
         "token_id": "SHADOW",
         "token_type": "native",
         "script_pub_key": "..."
@@ -474,7 +587,7 @@ curl http://localhost:8080/api/balance
 curl -X POST http://localhost:8080/api/transactions/send \
   -H "Content-Type: application/json" \
   -d '{
-    "to_address": "b9c144c9fed827ff2345678901bcdef123456789",
+    "to_address": "SB9c144C9Fed827fF2345678901BcdEF12345678901234567890bCdEf123456b",
     "amount": 100000000
   }'
 ```
