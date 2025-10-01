@@ -44,11 +44,18 @@ func CreateSimpleSendTransaction(fromUTXOs []*UTXO, toAddress Address, amount ui
 
 	builder := NewTxBuilder(TxTypeSend)
 
+	// Determine which token we're dealing with (use first UTXO's token)
+	var tokenID string
+	if len(fromUTXOs) > 0 {
+		tokenID = fromUTXOs[0].Output.TokenID
+	}
+
 	// Add inputs from UTXOs
 	totalInput := uint64(0)
 	for _, utxo := range fromUTXOs {
-		if utxo.Output.TokenID != "SHADOW" {
-			continue // Only spend SHADOW tokens for simple sends
+		// Only spend UTXOs of the same token type
+		if utxo.Output.TokenID != tokenID {
+			continue
 		}
 
 		builder.AddInput(utxo.TxID, utxo.OutputIndex)
@@ -69,13 +76,13 @@ func CreateSimpleSendTransaction(fromUTXOs []*UTXO, toAddress Address, amount ui
 		return nil, fmt.Errorf("insufficient funds: have %d, need %d", totalInput, amount+fee)
 	}
 
-	// Add recipient output
-	builder.AddOutput(toAddress, amount, "SHADOW")
+	// Add recipient output (use the token ID from UTXOs)
+	builder.AddOutput(toAddress, amount, tokenID)
 
 	// Add change output if needed
 	change := totalInput - amount - fee
 	if change > 0 {
-		builder.AddOutput(changeAddress, change, "SHADOW")
+		builder.AddOutput(changeAddress, change, tokenID)
 	}
 
 	return builder.Build(), nil

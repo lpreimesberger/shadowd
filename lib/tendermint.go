@@ -186,6 +186,28 @@ func (tn *TendermintNode) BroadcastTransaction(txBytes []byte) error {
 	return nil
 }
 
+// GetMempoolTransactions returns all pending transactions from the mempool
+func (tn *TendermintNode) GetMempoolTransactions() ([]*Transaction, error) {
+	if tn.node == nil {
+		return nil, fmt.Errorf("Tendermint node not started")
+	}
+
+	// Get all transactions from mempool (-1 means no limit)
+	txs := tn.node.Mempool().ReapMaxTxs(-1)
+
+	var transactions []*Transaction
+	for _, txBytes := range txs {
+		var tx Transaction
+		if err := json.Unmarshal(txBytes, &tx); err != nil {
+			// Skip transactions that can't be unmarshaled (might be non-JSON txs)
+			continue
+		}
+		transactions = append(transactions, &tx)
+	}
+
+	return transactions, nil
+}
+
 // SetNodeAddress sets the node wallet address for coinbase rewards
 func (tn *TendermintNode) SetNodeAddress(address Address) {
 	if tn.app != nil {
@@ -260,11 +282,11 @@ func initializeTendermintConfig(tmConfig *TendermintConfig) (*config.Config, err
 
 	// Set consensus configuration
 	cfg.Consensus.CreateEmptyBlocks = tmConfig.CreateEmptyBlocks
-	cfg.Consensus.CreateEmptyBlocksInterval = 30 * time.Second
+	cfg.Consensus.CreateEmptyBlocksInterval = 10 * time.Minute // Create block every 10 minutes
 	cfg.Consensus.TimeoutPropose = 3 * time.Second
 	cfg.Consensus.TimeoutPrevote = 1 * time.Second
 	cfg.Consensus.TimeoutPrecommit = 1 * time.Second
-	cfg.Consensus.TimeoutCommit = 1 * time.Second
+	cfg.Consensus.TimeoutCommit = 10 * time.Minute // Wait 10 minutes before next block
 
 	// Set mempool configuration
 	cfg.Mempool.Size = 5000

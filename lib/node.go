@@ -189,6 +189,7 @@ func (ns *NodeServer) startHTTPServer() error {
 	// UTXO and balance endpoints
 	mux.HandleFunc("/api/utxos", ns.handleGetUTXOs)
 	mux.HandleFunc("/api/balance", ns.handleGetBalance)
+	mux.HandleFunc("/api/mempool", ns.handleGetMempool)
 
 	// Admin endpoints
 	// TODO: REMOVE BEFORE PRODUCTION - Security risk!
@@ -538,10 +539,34 @@ func (ns *NodeServer) handleSendTransaction(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Get UTXO store from Tendermint app
+	if ns.tendermint == nil || ns.tendermint.app == nil {
+		http.Error(w, "Node not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Get UTXOs for the node wallet
+	utxos, err := ns.tendermint.app.utxoStore.GetUTXOsByAddress(ns.nodeWallet.Address)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get UTXOs: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Filter UTXOs for the specific token
+	var tokenUTXOs []*UTXO
+	for _, utxo := range utxos {
+		if utxo.Output.TokenID == tokenID && !utxo.IsSpent {
+			tokenUTXOs = append(tokenUTXOs, utxo)
+		}
+	}
+
+	if len(tokenUTXOs) == 0 {
+		http.Error(w, fmt.Sprintf("No UTXOs available for token %s", tokenID), http.StatusBadRequest)
+		return
+	}
+
 	// Create and sign transaction using wallet
-	// TODO: Get UTXOs from UTXO set when implemented
-	// For now, this will fail with "insufficient funds" which is expected
-	tx, err := ns.nodeWallet.CreateAndSignSendTransaction(nil, toAddress, req.Amount)
+	tx, err := ns.nodeWallet.CreateAndSignSendTransaction(tokenUTXOs, toAddress, req.Amount)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to create transaction: %v", err), http.StatusBadRequest)
 		return
@@ -740,15 +765,27 @@ func (ns *NodeServer) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get genesis token for base currency
-	genesisToken := GetGenesisToken()
-
-	// Build balance array with only base currency for now
+	// Build balance array with token details
 	balanceArray := []map[string]interface{}{}
-	if amount, exists := balances[genesisToken.TokenID]; exists {
+	for tokenID, amount := range balances {
+		// Get token info from registry
+		tokenInfo, exists := ns.tokenRegistry.GetToken(tokenID)
+		if !exists {
+			// Fallback for unknown tokens (shouldn't happen, but be defensive)
+			balanceArray = append(balanceArray, map[string]interface{}{
+				"token_id": tokenID,
+				"name":     "Unknown Token",
+				"decimals": 8, // Default to 8 decimals
+				"balance":  amount,
+			})
+			continue
+		}
+
 		balanceArray = append(balanceArray, map[string]interface{}{
-			"token_id": genesisToken.TokenID,
-			"name":     genesisToken.Name,
+			"token_id": tokenInfo.TokenID,
+			"name":     tokenInfo.Name,
+			"ticker":   tokenInfo.Ticker,
+			"decimals": tokenInfo.Decimals,
 			"balance":  amount,
 		})
 	}
@@ -756,6 +793,78 @@ func (ns *NodeServer) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 	response := map[string]interface{}{
 		"address":  addressStr,
 		"balances": balanceArray,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// handleGetMempool returns all pending transactions in the mempool
+func (ns *NodeServer) handleGetMempool(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Check if Tendermint node is initialized
+	if ns.tendermint == nil {
+		http.Error(w, "Node not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Get mempool transactions
+	transactions, err := ns.tendermint.GetMempoolTransactions()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get mempool transactions: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Build response with transaction details
+	txResponses := make([]map[string]interface{}, 0, len(transactions))
+	for _, tx := range transactions {
+		txID, _ := tx.ID()
+
+		// Build inputs info
+		inputs := make([]map[string]interface{}, len(tx.Inputs))
+		for i, input := range tx.Inputs {
+			inputs[i] = map[string]interface{}{
+				"prev_tx_id":   input.PrevTxID,
+				"output_index": input.OutputIndex,
+				"sequence":     input.Sequence,
+			}
+		}
+
+		// Build outputs info
+		outputs := make([]map[string]interface{}, len(tx.Outputs))
+		for i, output := range tx.Outputs {
+			outputs[i] = map[string]interface{}{
+				"address":    output.Address.String(),
+				"amount":     output.Amount,
+				"token_id":   output.TokenID,
+				"token_type": output.TokenType,
+			}
+		}
+
+		txResponse := map[string]interface{}{
+			"tx_id":     txID,
+			"tx_type":   tx.TxType,
+			"timestamp": tx.Timestamp,
+			"token_id":  tx.TokenID,
+			"inputs":    inputs,
+			"outputs":   outputs,
+		}
+
+		// Add memo if present
+		if len(tx.Data) > 0 {
+			txResponse["memo"] = string(tx.Data)
+		}
+
+		txResponses = append(txResponses, txResponse)
+	}
+
+	response := map[string]interface{}{
+		"count":        len(txResponses),
+		"transactions": txResponses,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -817,9 +926,9 @@ func (ns *NodeServer) handleGetTransactions(w http.ResponseWriter, r *http.Reque
 		inputs := make([]map[string]interface{}, len(tx.Inputs))
 		for i, input := range tx.Inputs {
 			inputs[i] = map[string]interface{}{
-				"prev_tx_id":     input.PrevTxID,
-				"output_index":   input.OutputIndex,
-				"sequence":       input.Sequence,
+				"prev_tx_id":   input.PrevTxID,
+				"output_index": input.OutputIndex,
+				"sequence":     input.Sequence,
 			}
 		}
 
@@ -827,9 +936,9 @@ func (ns *NodeServer) handleGetTransactions(w http.ResponseWriter, r *http.Reque
 		outputs := make([]map[string]interface{}, len(tx.Outputs))
 		for i, output := range tx.Outputs {
 			outputs[i] = map[string]interface{}{
-				"address":   output.Address.String(),
-				"amount":    output.Amount,
-				"token_id":  output.TokenID,
+				"address":    output.Address.String(),
+				"amount":     output.Amount,
+				"token_id":   output.TokenID,
 				"token_type": output.TokenType,
 			}
 		}

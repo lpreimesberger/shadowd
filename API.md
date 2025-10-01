@@ -213,6 +213,64 @@ Legacy endpoint that returns placeholder balance information.
 
 ## UTXO and Balance Queries
 
+### Get Mempool Transactions
+Returns all pending transactions currently in the mempool waiting to be included in a block.
+
+**Endpoint:** `GET /api/mempool`
+
+**Example:**
+```bash
+curl http://localhost:8080/api/mempool
+```
+
+**Response:**
+```json
+{
+  "count": 2,
+  "transactions": [
+    {
+      "tx_id": "abc123def456...",
+      "tx_type": 1,
+      "timestamp": 1727632800,
+      "token_id": "ee5ccf1bab2fa5ce60bbaec533faf8332a637045b5c6d47803dce25e1591b626",
+      "inputs": [
+        {
+          "prev_tx_id": "def789...",
+          "output_index": 0,
+          "sequence": 4294967295
+        }
+      ],
+      "outputs": [
+        {
+          "address": "SB9c144C9Fed827fF2345678901BcdEF12345678901234567890bCdEf123456b",
+          "amount": 1000000000,
+          "token_id": "ee5ccf1bab2fa5ce60bbaec533faf8332a637045b5c6d47803dce25e1591b626",
+          "token_type": "native"
+        }
+      ],
+      "memo": "Payment #123"
+    }
+  ]
+}
+```
+
+**Response Fields:**
+- `count`: Number of pending transactions
+- `transactions`: Array of transaction objects
+  - `tx_id`: Transaction hash
+  - `tx_type`: Transaction type (0=Coinbase, 1=Send, 2=Mint, 3=Melt)
+  - `timestamp`: Unix timestamp when transaction was created
+  - `token_id`: Primary token being transferred
+  - `inputs`: Array of UTXOs being spent
+  - `outputs`: Array of new UTXOs being created
+  - `memo`: Optional memo/tag if present
+
+**Notes:**
+- Transactions remain in mempool until included in a block
+- Mempool has size limit (default 5000 transactions)
+- Invalid transactions are rejected during CheckTx and won't appear here
+- Transaction order may not reflect inclusion order in next block
+
 ### Get Address Balance
 Returns the current balance for any address by querying the UTXO set.
 
@@ -232,13 +290,17 @@ curl "http://localhost:8080/api/balance?address=SA8b033b8fDe716eE1234567890aBcdE
   "address": "SA8b033b8fDe716eE1234567890aBcdEF12345678901234567890aBcdEf123456a",
   "balances": [
     {
-      "token_id": "a1b2c3d4e5f6...",
+      "token_id": "ee5ccf1bab2fa5ce60bbaec533faf8332a637045b5c6d47803dce25e1591b626",
       "name": "Shadow",
+      "ticker": "SHADOW",
+      "decimals": 8,
       "balance": 5000000000
     },
     {
-      "token_id": "f6e5d4c3b2a1...",
+      "token_id": "f6e5d4c3b2a1a9b8c7d6e5f4a3b2c1d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6",
       "name": "Custom Token",
+      "ticker": "CUST",
+      "decimals": 6,
       "balance": 1000000
     }
   ]
@@ -250,11 +312,24 @@ curl "http://localhost:8080/api/balance?address=SA8b033b8fDe716eE1234567890aBcdE
 - `balances`: Array of token balances
   - `token_id`: The unique hash identifier for the token
   - `name`: Token name ("Shadow" for SHADOW base currency, or custom name for minted tokens)
-  - `balance`: Amount in smallest units (8 decimal places)
+  - `ticker`: Token ticker symbol (e.g., "SHADOW", "CUST")
+  - `decimals`: Number of decimal places for display formatting
+  - `balance`: Amount in smallest units (base units, not decimalized)
 
 **Balance Format:**
-- All amounts are in the smallest unit (8 decimal places for SHADOW)
-- `5000000000` = 50.00000000 SHADOW tokens
+- Amounts are always in the smallest base unit (atomic units)
+- Use the `decimals` field to format for display
+- Example with `decimals: 8`: `5000000000` base units = `50.00000000` tokens
+- Example with `decimals: 6`: `1000000` base units = `1.000000` tokens
+
+**Client-Side Formatting:**
+```javascript
+function formatBalance(balance, decimals) {
+  return (balance / Math.pow(10, decimals)).toFixed(decimals);
+}
+
+// Example: formatBalance(5000000000, 8) => "50.00000000"
+```
 
 ### Get Address Transactions
 Returns paginated transaction history for an address.
