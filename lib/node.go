@@ -190,6 +190,10 @@ func (ns *NodeServer) startHTTPServer() error {
 	mux.HandleFunc("/api/utxos", ns.handleGetUTXOs)
 	mux.HandleFunc("/api/balance", ns.handleGetBalance)
 
+	// Admin endpoints
+	// TODO: REMOVE BEFORE PRODUCTION - Security risk!
+	mux.HandleFunc("/api/admin/shutdown", ns.handleAdminShutdown)
+
 	// Health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -458,20 +462,24 @@ func (ns *NodeServer) handleWalletBalance(w http.ResponseWriter, r *http.Request
 
 // handleTokens returns token registry information
 func (ns *NodeServer) handleTokens(w http.ResponseWriter, r *http.Request) {
-	genesisToken := GetGenesisToken()
-	tokens := map[string]interface{}{
-		"count":         ns.tokenRegistry.GetTokenCount(),
-		"genesis_token": genesisToken,
+	allTokens := ns.tokenRegistry.ListTokens()
+
+	response := map[string]interface{}{
+		"count":  len(allTokens),
+		"tokens": allTokens,
 	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(tokens)
+	json.NewEncoder(w).Encode(response)
 }
 
 // SendTransactionRequest represents a transaction send request
 type SendTransactionRequest struct {
 	ToAddress string `json:"to_address"`
 	Amount    uint64 `json:"amount"`
-	Fee       uint64 `json:"fee,omitempty"`
+	TokenID   string `json:"token_id,omitempty"` // Optional: defaults to SHADOW base token
+	Fee       uint64 `json:"fee,omitempty"`      // Optional: defaults to 1000
+	Memo      string `json:"memo,omitempty"`     // Optional: 64 byte ASCII memo/tag
 }
 
 // SubmitTransactionRequest represents a raw transaction submission
@@ -492,6 +500,20 @@ func (ns *NodeServer) handleSendTransaction(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Validate memo/tag (max 64 bytes, ASCII only)
+	if req.Memo != "" {
+		if len(req.Memo) > 64 {
+			http.Error(w, "Memo must be 64 bytes or less", http.StatusBadRequest)
+			return
+		}
+		for _, r := range req.Memo {
+			if r > 127 {
+				http.Error(w, "Memo must contain only ASCII characters", http.StatusBadRequest)
+				return
+			}
+		}
+	}
+
 	// Parse address
 	toAddress, _, err := ParseAddress(req.ToAddress)
 	if err != nil {
@@ -504,6 +526,18 @@ func (ns *NodeServer) handleSendTransaction(w http.ResponseWriter, r *http.Reque
 		req.Fee = 1000 // Default fee
 	}
 
+	// Set default token ID if not provided (use SHADOW base token)
+	tokenID := req.TokenID
+	if tokenID == "" || tokenID == "SHADOW" {
+		tokenID = GetGenesisToken().TokenID
+	}
+
+	// Validate token ID exists
+	if !IsValidTokenID(tokenID) {
+		http.Error(w, fmt.Sprintf("Invalid or unknown token_id: %s", tokenID), http.StatusBadRequest)
+		return
+	}
+
 	// Create and sign transaction using wallet
 	// TODO: Get UTXOs from UTXO set when implemented
 	// For now, this will fail with "insufficient funds" which is expected
@@ -512,6 +546,14 @@ func (ns *NodeServer) handleSendTransaction(w http.ResponseWriter, r *http.Reque
 		http.Error(w, fmt.Sprintf("Failed to create transaction: %v", err), http.StatusBadRequest)
 		return
 	}
+
+	// Add memo to transaction data if provided
+	if req.Memo != "" {
+		tx.Data = []byte(req.Memo)
+	}
+
+	// Set the token ID on the transaction
+	tx.TokenID = tokenID
 
 	// Submit transaction to mempool
 	if err := ns.submitTransactionToMempool(tx); err != nil {
@@ -811,6 +853,38 @@ func (ns *NodeServer) handleGetTransactions(w http.ResponseWriter, r *http.Reque
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+// handleAdminShutdown performs a graceful shutdown of the node
+// TODO: REMOVE BEFORE PRODUCTION - This is a security risk and should only be used for testing
+func (ns *NodeServer) handleAdminShutdown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !ns.config.Quiet {
+		log.Println("🛑 Received shutdown request via API")
+	}
+
+	// Send response before shutting down
+	w.Header().Set("Content-Type", "application/json")
+	response := map[string]string{
+		"status":  "shutting_down",
+		"message": "Node is performing graceful shutdown",
+	}
+	json.NewEncoder(w).Encode(response)
+
+	// Flush response to client
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	// Trigger shutdown after a brief delay to ensure response is sent
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		ns.shutdown <- true
+	}()
 }
 
 // handleSignals sets up signal handling for graceful shutdown

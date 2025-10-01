@@ -268,23 +268,39 @@ Creates, signs, and submits a simple send transaction.
 {
   "to_address": "b9c144c9fed827ff2345678901bcdef123456789",
   "amount": 1000000000,
-  "fee": 1000
+  "token_id": "ee5ccf1bab2fa5ce60bbaec533faf8332a637045b5c6d47803dce25e1591b626",
+  "fee": 1000,
+  "memo": "Payment for services"
 }
 ```
 
 **Parameters:**
 - `to_address` (required): Recipient address
 - `amount` (required): Amount to send in smallest units
+- `token_id` (optional): Token identifier hash. Defaults to SHADOW base token if not provided or set to "SHADOW"
 - `fee` (optional): Transaction fee in smallest units. Default: 1000
+- `memo` (optional): ASCII-only memo/tag up to 64 bytes for transaction identification
 
-**Example:**
+**Examples:**
 ```bash
+# Send SHADOW base currency
 curl -X POST http://localhost:8080/api/transactions/send \
   -H "Content-Type: application/json" \
   -d '{
     "to_address": "b9c144c9fed827ff2345678901bcdef123456789",
     "amount": 1000000000,
     "fee": 1000
+  }'
+
+# Send custom token with memo
+curl -X POST http://localhost:8080/api/transactions/send \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to_address": "b9c144c9fed827ff2345678901bcdef123456789",
+    "amount": 500000000,
+    "token_id": "f6e5d4c3b2a1...",
+    "fee": 2000,
+    "memo": "Invoice #12345"
   }'
 ```
 
@@ -349,6 +365,40 @@ Submits a pre-signed transaction to the mempool.
   "message": "Transaction submitted to mempool"
 }
 ```
+
+---
+
+## Admin Endpoints (Testing Only)
+
+### Shutdown Node
+**⚠️ WARNING: This endpoint should be REMOVED before production deployment!**
+
+Performs a graceful shutdown of the node. Useful for automated testing to avoid corrupting Tendermint data.
+
+**Endpoint:** `GET /api/admin/shutdown` or `POST /api/admin/shutdown`
+
+**Example:**
+```bash
+curl http://localhost:8080/api/admin/shutdown
+```
+
+**Response:**
+```json
+{
+  "status": "shutting_down",
+  "message": "Node is performing graceful shutdown"
+}
+```
+
+**Shutdown Process:**
+1. Sends response to client
+2. Stops Tendermint node (flushes all data)
+3. Stops HTTP server with 5s timeout
+4. Closes shell
+5. Waits for all goroutines to complete
+6. Exits cleanly
+
+**Security Note:** This endpoint allows anyone with network access to shut down the node. It exists only for testing automation and **MUST BE REMOVED** before any production or mainnet deployment.
 
 ---
 

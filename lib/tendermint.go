@@ -375,8 +375,15 @@ func NewShadowyApp(nodeAddress Address) *ShadowyApp {
 		database = levelDB
 	}
 
+	utxoStore := NewUTXOStore(database)
+
+	// Migrate existing coinbase transactions from UTXOs
+	if err := utxoStore.MigrateCoinbaseTransactions(); err != nil {
+		log.Printf("Warning: Failed to migrate coinbase transactions: %v", err)
+	}
+
 	return &ShadowyApp{
-		utxoStore:   NewUTXOStore(database),
+		utxoStore:   utxoStore,
 		nodeAddress: nodeAddress,
 	}
 }
@@ -498,7 +505,7 @@ func (app *ShadowyApp) BeginBlock(req abcitypes.RequestBeginBlock) abcitypes.Res
 		}
 
 		// Create coinbase transaction for mining reward
-		blockReward := uint64(50 * 1e6) // 50 SHADOWY tokens (assuming 6 decimals)
+		blockReward := uint64(50 * 1e8) // 50 SHADOW tokens (8 decimals)
 
 		// Properly derive the miner address from the public key
 		minerPubKey := &mldsa87.PublicKey{}

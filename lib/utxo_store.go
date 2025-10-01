@@ -3,6 +3,7 @@ package lib
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 
 	db "github.com/cometbft/cometbft-db"
@@ -298,7 +299,7 @@ func (store *UTXOStore) StoreTransaction(tx *Transaction, height int64) error {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 
-	txID, err := tx.CalculateHash()
+	txID, err := tx.ID()
 	if err != nil {
 		return fmt.Errorf("failed to calculate transaction hash: %w", err)
 	}
@@ -334,7 +335,7 @@ func (store *UTXOStore) StoreTransaction(tx *Transaction, height int64) error {
 	// Format: addrtx:{address}:{height}:{txid}
 	// Using negative height for reverse chronological order
 	for addrStr := range addressMap {
-		addrTxKey := fmt.Sprintf("%s%s:%020d:%s", AddrTxPrefix, addrStr, 9999999999999999999-height, txID)
+		addrTxKey := fmt.Sprintf("%s%s:%020d:%s", AddrTxPrefix, addrStr, int64(999999999999999999)-height, txID)
 		if err := store.db.Set([]byte(addrTxKey), []byte("")); err != nil {
 			return fmt.Errorf("failed to store address-tx index: %w", err)
 		}
@@ -472,4 +473,83 @@ func (store *UTXOStore) GetTransactionsByAddress(address Address, count int, aft
 // Helper function to check prefix
 func startsWithPrefix(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+// MigrateCoinbaseTransactions creates transaction records for existing coinbase UTXOs
+// This is a migration function to backfill transaction history from existing UTXO data
+func (store *UTXOStore) MigrateCoinbaseTransactions() error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+
+	// Iterate through all UTXOs
+	iterator, err := store.db.Iterator([]byte(UTXOPrefix), nil)
+	if err != nil {
+		return fmt.Errorf("failed to create iterator: %w", err)
+	}
+	defer iterator.Close()
+
+	txSeen := make(map[string]bool)
+	migrated := 0
+
+	for ; iterator.Valid(); iterator.Next() {
+		// Get UTXO data
+		data := iterator.Value()
+		if data == nil {
+			continue
+		}
+
+		var utxo UTXO
+		if err := json.Unmarshal(data, &utxo); err != nil {
+			continue
+		}
+
+		// Skip if we've already processed this transaction
+		if txSeen[utxo.TxID] {
+			continue
+		}
+		txSeen[utxo.TxID] = true
+
+		// Check if transaction already exists
+		txKey := fmt.Sprintf("%s%s", TxPrefix, utxo.TxID)
+		existing, _ := store.db.Get([]byte(txKey))
+		if existing != nil {
+			continue // Already have this transaction
+		}
+
+		// Reconstruct a coinbase transaction from the UTXO
+		// We can only reconstruct coinbase transactions (no inputs)
+		tx := &Transaction{
+			TxType:    TxTypeCoinbase,
+			Version:   1,
+			Timestamp: 0, // Unknown, but doesn't matter for display
+			LockTime:  0,
+			TokenID:   utxo.Output.TokenID,
+			Inputs:    []*TxInput{}, // Coinbase has no inputs
+			Outputs:   []*TxOutput{utxo.Output},
+		}
+
+		// Store the reconstructed transaction
+		txData, err := json.Marshal(tx)
+		if err != nil {
+			continue
+		}
+
+		if err := store.db.Set([]byte(txKey), txData); err != nil {
+			continue
+		}
+
+		// Create address-tx index
+		addrTxKey := fmt.Sprintf("%s%s:%020d:%s", AddrTxPrefix, utxo.Output.Address.String(), int64(999999999999999999)-int64(utxo.BlockHeight), utxo.TxID)
+		if err := store.db.Set([]byte(addrTxKey), []byte("")); err != nil {
+			continue
+		}
+
+		migrated++
+	}
+
+	if migrated > 0 {
+		log.Printf("✅ Migrated %d coinbase transactions from UTXOs", migrated)
+	}
+
+	return nil
 }
