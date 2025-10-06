@@ -292,8 +292,8 @@ func (nw *NodeWallet) CreateAndSignTransaction(to Address, amount, fee, nonce ui
 // --- New UTXO-based transaction methods ---
 
 // CreateCoinbaseTransaction creates a coinbase transaction for mining rewards
-func (nw *NodeWallet) CreateCoinbaseTransaction(blockHeight uint64, reward uint64) *Transaction {
-	return CreateCoinbaseTransaction(nw.Address, blockHeight, reward)
+func (nw *NodeWallet) CreateCoinbaseTransaction(blockHeight uint64, reward uint64, blockTimestamp int64) *Transaction {
+	return CreateCoinbaseTransaction(nw.Address, blockHeight, reward, blockTimestamp)
 }
 
 // CreateSimpleSendTransaction creates a simple send transaction (requires UTXOs)
@@ -312,8 +312,8 @@ func (nw *NodeWallet) CreateMeltTransaction(utxos []*UTXO, reason string) *Trans
 }
 
 // CreateAndSignCoinbaseTransaction creates and signs a coinbase transaction
-func (nw *NodeWallet) CreateAndSignCoinbaseTransaction(blockHeight uint64, reward uint64) (*Transaction, error) {
-	tx := nw.CreateCoinbaseTransaction(blockHeight, reward)
+func (nw *NodeWallet) CreateAndSignCoinbaseTransaction(blockHeight uint64, reward uint64, blockTimestamp int64) (*Transaction, error) {
+	tx := nw.CreateCoinbaseTransaction(blockHeight, reward, blockTimestamp)
 
 	if err := nw.SignTransaction(tx); err != nil {
 		return nil, fmt.Errorf("failed to sign coinbase transaction: %w", err)

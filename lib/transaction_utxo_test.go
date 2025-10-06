@@ -3,6 +3,7 @@ package lib
 import (
 	"fmt"
 	"testing"
+	"time"
 )
 
 func TestNewTxBuilder(t *testing.T) {
@@ -99,7 +100,7 @@ func TestCreateCoinbaseTransaction(t *testing.T) {
 	blockHeight := uint64(12345)
 	reward := uint64(5000000000) // 50 SHADOW
 
-	tx := CreateCoinbaseTransaction(minerAddress, blockHeight, reward)
+	tx := CreateCoinbaseTransaction(minerAddress, blockHeight, reward, time.Now().Unix())
 
 	// Validate basic structure
 	if tx.TxType != TxTypeCoinbase {

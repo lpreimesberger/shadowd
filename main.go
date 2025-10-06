@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"shadowy/lib"
 )
@@ -106,8 +107,9 @@ func main() {
 	}
 	blockHeight := uint64(12345)
 	reward := uint64(5000000000) // 50 SHADOW
+	blockTimestamp := time.Now().Unix()
 
-	coinbaseTx, err := nodeWallet.CreateAndSignCoinbaseTransaction(blockHeight, reward)
+	coinbaseTx, err := nodeWallet.CreateAndSignCoinbaseTransaction(blockHeight, reward, blockTimestamp)
 	if err != nil {
 		log.Fatal("Failed to create coinbase transaction:", err)
 	}

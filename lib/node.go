@@ -364,6 +364,78 @@ func (ns *NodeServer) addShellCommands() {
 			}
 		},
 	})
+
+	ns.shell.AddCmd(&ishell.Cmd{
+		Name: "mempool",
+		Help: "Display pending transactions in mempool",
+		Func: func(c *ishell.Context) {
+			if ns.tendermint == nil {
+				c.Println("❌ Tendermint node not initialized")
+				return
+			}
+
+			// Get mempool transactions
+			mempool := ns.tendermint.GetMempool()
+			if mempool == nil {
+				c.Println("❌ Mempool not available")
+				return
+			}
+
+			txs := mempool.ReapMaxTxs(-1) // Get all transactions
+			c.Printf("📋 Mempool Status\n")
+			c.Printf("=================\n")
+			c.Printf("Pending Transactions: %d\n", len(txs))
+			c.Printf("Mempool Size: %d bytes\n", mempool.Size())
+			c.Printf("Total Tx Count: %d\n", mempool.TxsAvailable())
+			c.Println()
+
+			if len(txs) > 0 {
+				c.Println("Transactions:")
+				for i, tx := range txs {
+					c.Printf("  %d. %x... (%d bytes)\n", i+1, tx[:min(16, len(tx))], len(tx))
+				}
+			}
+		},
+	})
+
+	ns.shell.AddCmd(&ishell.Cmd{
+		Name: "peers",
+		Help: "Display connected peers",
+		Func: func(c *ishell.Context) {
+			if ns.tendermint == nil {
+				c.Println("❌ Tendermint node not initialized")
+				return
+			}
+
+			peers := ns.tendermint.GetPeers()
+			c.Printf("🌐 Network Peers\n")
+			c.Printf("================\n")
+			c.Printf("Connected Peers: %d\n", len(peers))
+			c.Println()
+
+			if len(peers) > 0 {
+				for i, peer := range peers {
+					c.Printf("  %d. ID: %s\n", i+1, peer.ID)
+					c.Printf("     Address: %s\n", peer.RemoteAddr)
+					if peer.IsOutbound {
+						c.Printf("     Direction: Outbound\n")
+					} else {
+						c.Printf("     Direction: Inbound\n")
+					}
+					c.Println()
+				}
+			} else {
+				c.Println("  No peers connected")
+			}
+		},
+	})
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // getNodeStatus returns the current node status

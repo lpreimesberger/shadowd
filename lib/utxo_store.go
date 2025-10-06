@@ -25,6 +25,7 @@ const (
 	TxPrefix         = "tx:"      // tx:{txid} -> Transaction
 	AddrTxPrefix     = "addrtx:"  // addrtx:{address}:{height}:{txid} -> ""
 	AddrTxIndexCount = "atxcnt:"  // atxcnt:{address} -> count
+	ValidatorPrefix  = "val:"     // val:{proposer_address_hex} -> wallet_address
 )
 
 // NewUTXOStore creates a new UTXO store with the given database
@@ -108,14 +109,29 @@ func (store *UTXOStore) SpendUTXO(txID string, outputIndex uint32) error {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 
-	// Get the UTXO first
-	utxo, err := store.GetUTXO(txID, outputIndex)
-	if err != nil {
-		return err
+	// Get the UTXO first (without acquiring lock since we already have it)
+	key := fmt.Sprintf("%s%s:%d", UTXOPrefix, txID, outputIndex)
+
+	// Check cache first
+	utxo, exists := store.cache[key]
+	if !exists {
+		// Check database
+		data, err := store.db.Get([]byte(key))
+		if err != nil {
+			return fmt.Errorf("failed to get UTXO from database: %w", err)
+		}
+		if data == nil {
+			return fmt.Errorf("UTXO not found: %s:%d", txID, outputIndex)
+		}
+
+		var u UTXO
+		if err := json.Unmarshal(data, &u); err != nil {
+			return fmt.Errorf("failed to unmarshal UTXO: %w", err)
+		}
+		utxo = &u
+		store.cache[key] = utxo
 	}
-	if utxo == nil {
-		return fmt.Errorf("UTXO not found: %s:%d", txID, outputIndex)
-	}
+
 	if utxo.IsSpent {
 		return fmt.Errorf("UTXO already spent: %s:%d", txID, outputIndex)
 	}
@@ -123,8 +139,7 @@ func (store *UTXOStore) SpendUTXO(txID string, outputIndex uint32) error {
 	// Mark as spent
 	utxo.IsSpent = true
 
-	// Update in database
-	key := fmt.Sprintf("%s%s:%d", UTXOPrefix, txID, outputIndex)
+	// Update in database (key already defined above)
 	data, err := json.Marshal(utxo)
 	if err != nil {
 		return fmt.Errorf("failed to marshal UTXO: %w", err)
@@ -325,7 +340,23 @@ func (store *UTXOStore) StoreTransaction(tx *Transaction, height int64) error {
 
 	// Collect addresses from inputs (via UTXOs)
 	for _, input := range tx.Inputs {
-		utxo, _ := store.GetUTXO(input.PrevTxID, input.OutputIndex)
+		// Get UTXO directly from cache/database (we already hold the write lock)
+		key := fmt.Sprintf("%s%s:%d", UTXOPrefix, input.PrevTxID, input.OutputIndex)
+
+		// Check cache first
+		utxo, exists := store.cache[key]
+		if !exists {
+			// Check database directly (no nested lock)
+			data, err := store.db.Get([]byte(key))
+			if err == nil && data != nil {
+				var u UTXO
+				if err := json.Unmarshal(data, &u); err == nil {
+					utxo = &u
+					store.cache[key] = utxo
+				}
+			}
+		}
+
 		if utxo != nil {
 			addressMap[utxo.Output.Address.String()] = true
 		}
@@ -473,6 +504,47 @@ func (store *UTXOStore) GetTransactionsByAddress(address Address, count int, aft
 // Helper function to check prefix
 func startsWithPrefix(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+// RegisterValidator stores a validator's wallet address for block rewards
+func (store *UTXOStore) RegisterValidator(proposerAddr []byte, walletAddr Address) error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+
+	key := fmt.Sprintf("%s%x", ValidatorPrefix, proposerAddr)
+	data, err := json.Marshal(walletAddr)
+	if err != nil {
+		return fmt.Errorf("failed to marshal wallet address: %w", err)
+	}
+
+	if err := store.db.Set([]byte(key), data); err != nil {
+		return fmt.Errorf("failed to store validator registration: %w", err)
+	}
+
+	log.Printf("✅ Validator registered: %x -> %s", proposerAddr, walletAddr.String()[:20]+"...")
+	return nil
+}
+
+// GetValidatorWallet retrieves a validator's registered wallet address
+func (store *UTXOStore) GetValidatorWallet(proposerAddr []byte) (*Address, error) {
+	store.mutex.RLock()
+	defer store.mutex.RUnlock()
+
+	key := fmt.Sprintf("%s%x", ValidatorPrefix, proposerAddr)
+	data, err := store.db.Get([]byte(key))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get validator wallet: %w", err)
+	}
+	if data == nil {
+		return nil, nil // Not registered
+	}
+
+	var addr Address
+	if err := json.Unmarshal(data, &addr); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal wallet address: %w", err)
+	}
+
+	return &addr, nil
 }
 
 // MigrateCoinbaseTransactions creates transaction records for existing coinbase UTXOs

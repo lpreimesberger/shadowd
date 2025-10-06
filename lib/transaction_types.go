@@ -6,8 +6,12 @@ import (
 )
 
 // CreateCoinbaseTransaction creates a coinbase transaction for mining rewards
-func CreateCoinbaseTransaction(minerAddress Address, blockHeight uint64, reward uint64) *Transaction {
+func CreateCoinbaseTransaction(minerAddress Address, blockHeight uint64, reward uint64, blockTimestamp int64) *Transaction {
 	builder := NewTxBuilder(TxTypeCoinbase)
+
+	// Set deterministic timestamp from block height (critical for consensus)
+	// Using block height instead of wall-clock time ensures perfect determinism
+	builder.SetTimestamp(int64(blockHeight))
 
 	// Add mining reward output
 	builder.AddOutput(minerAddress, reward, "SHADOW")

@@ -20,6 +20,9 @@ const (
 
 	// TxTypeMelt explicitly destroys tokens/assets (e.g., revoking swap offers)
 	TxTypeMelt TxType = 3
+
+	// TxTypeRegisterValidator registers a validator's wallet address for block rewards
+	TxTypeRegisterValidator TxType = 4
 )
 
 // String returns the string representation of a transaction type
@@ -33,6 +36,8 @@ func (tt TxType) String() string {
 		return "mint_token"
 	case TxTypeMelt:
 		return "melt"
+	case TxTypeRegisterValidator:
+		return "register_validator"
 	default:
 		return fmt.Sprintf("unknown(%d)", int(tt))
 	}

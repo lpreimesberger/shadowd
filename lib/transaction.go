@@ -186,7 +186,7 @@ func ValidateTransaction(tx *Transaction) error {
 	}
 
 	// Validate transaction type
-	if tx.TxType < TxTypeCoinbase || tx.TxType > TxTypeMelt {
+	if tx.TxType < TxTypeCoinbase || tx.TxType > TxTypeRegisterValidator {
 		return fmt.Errorf("invalid transaction type: %d", int(tx.TxType))
 	}
 
@@ -200,9 +200,27 @@ func ValidateTransaction(tx *Transaction) error {
 		return validateMintTokenTransaction(tx)
 	case TxTypeMelt:
 		return validateMeltTransaction(tx)
+	case TxTypeRegisterValidator:
+		return validateRegisterValidatorTransaction(tx)
 	default:
 		return fmt.Errorf("unsupported transaction type: %s", tx.TxType.String())
 	}
+}
+
+// validateRegisterValidatorTransaction validates validator registration transactions
+func validateRegisterValidatorTransaction(tx *Transaction) error {
+	// Validator registration should have no inputs or outputs (state change only)
+	if len(tx.Inputs) != 0 {
+		return fmt.Errorf("validator registration must have no inputs")
+	}
+	if len(tx.Outputs) != 0 {
+		return fmt.Errorf("validator registration must have no outputs")
+	}
+	// Data should contain proposer address (20 bytes) + wallet address (32 bytes)
+	if len(tx.Data) != 52 {
+		return fmt.Errorf("validator registration data must be 52 bytes (20 + 32), got %d", len(tx.Data))
+	}
+	return nil
 }
 
 // validateCoinbaseTransaction validates coinbase (mining reward) transactions

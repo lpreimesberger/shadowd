@@ -3,7 +3,6 @@ package lib
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,7 +11,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/cloudflare/circl/sign/mldsa/mldsa87"
+	"golang.org/x/crypto/blake2b"
+
 	db "github.com/cometbft/cometbft-db"
 	abcitypes "github.com/cometbft/cometbft/abci/types"
 	"github.com/cometbft/cometbft/config"
@@ -98,8 +98,19 @@ func NewTendermintNode(tmConfig *TendermintConfig) (*TendermintNode, error) {
 	var defaultAddress Address
 	app := NewShadowyApp(defaultAddress)
 
-	// Load validator (matches genesis)
+	// Check if we have a validator key (determines if we're a validator or full node)
+	validatorKeyExists := false
+	if _, err := os.Stat(cfg.PrivValidatorKeyFile()); err == nil {
+		validatorKeyExists = true
+	}
+
+	// Load validator - always load even for non-validators to avoid nil pointer
+	// Tendermint will create the files if they don't exist, but won't use them
+	// if this node isn't in the genesis validators list
 	pv := privval.LoadOrGenFilePV(cfg.PrivValidatorKeyFile(), cfg.PrivValidatorStateFile())
+
+	// Set validator flag on app
+	app.isValidator = validatorKeyExists
 
 	// Load node key from persistent location (outside blockchain directory)
 	persistentNodeKeyFile := "node_key.json"
@@ -242,6 +253,45 @@ func (tn *TendermintNode) SaveNodeIDToFile(filename string) error {
 	return os.WriteFile(filename, []byte(nodeID), 0644)
 }
 
+// GetMempool returns the node's mempool
+func (tn *TendermintNode) GetMempool() mempool.Mempool {
+	if tn.node == nil {
+		return nil
+	}
+	return tn.node.Mempool()
+}
+
+// PeerInfo represents information about a connected peer
+type PeerInfo struct {
+	ID         string
+	RemoteAddr string
+	IsOutbound bool
+}
+
+// GetPeers returns information about connected peers
+func (tn *TendermintNode) GetPeers() []PeerInfo {
+	if tn.node == nil {
+		return nil
+	}
+
+	sw := tn.node.Switch()
+	if sw == nil {
+		return nil
+	}
+
+	peers := sw.Peers().List()
+	var peerInfos []PeerInfo
+	for _, peer := range peers {
+		peerInfos = append(peerInfos, PeerInfo{
+			ID:         string(peer.ID()),
+			RemoteAddr: peer.RemoteAddr().String(),
+			IsOutbound: peer.IsOutbound(),
+		})
+	}
+
+	return peerInfos
+}
+
 // initializeTendermintConfig initializes the Tendermint configuration directory and files
 func initializeTendermintConfig(tmConfig *TendermintConfig) (*config.Config, error) {
 	// Create home directory
@@ -266,14 +316,19 @@ func initializeTendermintConfig(tmConfig *TendermintConfig) (*config.Config, err
 	// AddrBook path is relative to root, so just use config/addrbook.json
 	cfg.P2P.AddrBook = "config/addrbook.json"
 
-	// Set seed nodes
+	// Enable peer exchange for peer discovery
+	cfg.P2P.PexReactor = true
+	cfg.P2P.AllowDuplicateIP = true // Allow multiple nodes from same IP for testing
+
+	// Set persistent peers (stay connected) instead of seeds (connect once)
+	// For small networks, persistent peers work better than seeds
 	if len(tmConfig.Seeds) > 0 {
-		cfg.P2P.Seeds = ""
+		cfg.P2P.PersistentPeers = ""
 		for i, seed := range tmConfig.Seeds {
 			if i > 0 {
-				cfg.P2P.Seeds += ","
+				cfg.P2P.PersistentPeers += ","
 			}
-			cfg.P2P.Seeds += seed
+			cfg.P2P.PersistentPeers += seed
 		}
 	}
 
@@ -282,72 +337,25 @@ func initializeTendermintConfig(tmConfig *TendermintConfig) (*config.Config, err
 
 	// Set consensus configuration
 	cfg.Consensus.CreateEmptyBlocks = tmConfig.CreateEmptyBlocks
-	cfg.Consensus.CreateEmptyBlocksInterval = 10 * time.Minute // Create block every 10 minutes
+	cfg.Consensus.CreateEmptyBlocksInterval = 5 * time.Second // Create block every 5 seconds
 	cfg.Consensus.TimeoutPropose = 3 * time.Second
 	cfg.Consensus.TimeoutPrevote = 1 * time.Second
 	cfg.Consensus.TimeoutPrecommit = 1 * time.Second
-	cfg.Consensus.TimeoutCommit = 10 * time.Minute // Wait 10 minutes before next block
+	cfg.Consensus.TimeoutCommit = 5 * time.Second // Wait 5 seconds before next block
 
 	// Set mempool configuration
 	cfg.Mempool.Size = 5000
 	cfg.Mempool.CacheSize = 10000
 	cfg.Mempool.MaxTxBytes = 1024 * 1024 // 1MB
+	cfg.Mempool.Broadcast = true          // Enable mempool transaction broadcasting to peers
 
 	// Set logging
 	cfg.LogLevel = tmConfig.LogLevel
 
-	// Load or generate validator key to create matching genesis
-	pv := privval.LoadOrGenFilePV(cfg.PrivValidatorKeyFile(), cfg.PrivValidatorStateFile())
-	pubKey, err := pv.GetPubKey()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get validator public key: %w", err)
-	}
-
-	// Generate genesis with the actual validator key
-	valAddr := pubKey.Address()
-	pubKeyBytes := pubKey.Bytes()
-	pubKeyB64 := base64.StdEncoding.EncodeToString(pubKeyBytes)
-
-	minimalGenesis := fmt.Sprintf(`{
-  "genesis_time": "2024-01-01T00:00:00.000Z",
-  "chain_id": "shadowy-testnet-1",
-  "initial_height": "1",
-  "consensus_params": {
-    "block": {
-      "max_bytes": "1048576",
-      "max_gas": "10000000",
-      "time_iota_ms": "1000"
-    },
-    "evidence": {
-      "max_age_num_blocks": "100000",
-      "max_age_duration": "172800000000000",
-      "max_bytes": "1048576"
-    },
-    "validator": {
-      "pub_key_types": ["ed25519"]
-    },
-    "version": {
-      "app_version": "1"
-    }
-  },
-  "validators": [
-    {
-      "address": "%X",
-      "pub_key": {
-        "type": "tendermint/PubKeyEd25519",
-        "value": "%s"
-      },
-      "power": "10",
-      "name": "auto-validator"
-    }
-  ],
-  "app_hash": "",
-  "app_state": {}
-}`, valAddr, pubKeyB64)
-
-	// Write genesis file
+	// Use the embedded hardcoded genesis (same for all nodes)
+	// This ensures all nodes are on the same blockchain
 	genesisPath := filepath.Join(tmConfig.HomeDir, "config", "genesis.json")
-	if err := os.WriteFile(genesisPath, []byte(minimalGenesis), 0644); err != nil {
+	if err := os.WriteFile(genesisPath, []byte(GetEmbeddedTestnetGenesis()), 0644); err != nil {
 		return nil, fmt.Errorf("failed to write genesis file: %w", err)
 	}
 
@@ -369,6 +377,15 @@ func RestoreTendermintLogging() {
 	log.SetOutput(os.Stderr)
 }
 
+// FarmerStats tracks farming participation for dynamic validator set
+type FarmerStats struct {
+	Address        Address
+	ProofCount     int64 // Total valid proofs submitted
+	LastProofHeight int64 // Last block height where proof was submitted
+	IsValidator    bool  // Currently in validator set
+	ValidatorPower int64 // Voting power (10 for now, will add staking later)
+}
+
 // ShadowyApp is a minimal ABCI application for Shadowy blockchain
 type ShadowyApp struct {
 	// Block height tracking
@@ -381,6 +398,11 @@ type ShadowyApp struct {
 	nodeAddress Address
 	// Node wallet private key for mining
 	nodePrivateKey []byte
+	// Farmer tracking for dynamic validator set
+	farmers map[string]*FarmerStats // key: address string
+	db      db.DB                   // Database for persistent state
+	// Flag indicating if this node is a validator
+	isValidator bool
 }
 
 // NewShadowyApp creates a new Shadowy ABCI application
@@ -404,10 +426,17 @@ func NewShadowyApp(nodeAddress Address) *ShadowyApp {
 		log.Printf("Warning: Failed to migrate coinbase transactions: %v", err)
 	}
 
-	return &ShadowyApp{
+	app := &ShadowyApp{
 		utxoStore:   utxoStore,
 		nodeAddress: nodeAddress,
+		farmers:     make(map[string]*FarmerStats),
+		db:          database,
 	}
+
+	// Load farmer stats from database
+	app.loadFarmerStats()
+
+	return app
 }
 
 // Info returns application info
@@ -432,27 +461,25 @@ func (app *ShadowyApp) InitChain(req abcitypes.RequestInitChain) abcitypes.Respo
 
 // CheckTx validates transactions for mempool
 func (app *ShadowyApp) CheckTx(req abcitypes.RequestCheckTx) abcitypes.ResponseCheckTx {
+	fmt.Printf("🔍 CheckTx START\n")
+
 	// Try to parse as JSON transaction first
 	var tx Transaction
 	if err := json.Unmarshal(req.Tx, &tx); err == nil {
-		// Standard Shadowy transaction - validate it
+		// Standard Shadowy transaction - validate signatures/structure only
+		// IMPORTANT: Do NOT validate against UTXO set here to avoid deadlocks
+		// The UTXO set is locked during block execution, and CheckTx can be called concurrently
 		if err := ValidateTransaction(&tx); err != nil {
+			fmt.Printf("🔍 CheckTx: Validation failed: %v\n", err)
 			return abcitypes.ResponseCheckTx{
 				Code: 1,
 				Log:  fmt.Sprintf("Invalid transaction: %v", err),
 			}
 		}
 
-		// Validate against UTXO set
-		if app.utxoStore != nil {
-			if err := app.utxoStore.ValidateTransaction(&tx); err != nil {
-				return abcitypes.ResponseCheckTx{
-					Code: 1,
-					Log:  fmt.Sprintf("UTXO validation failed: %v", err),
-				}
-			}
-		}
-
+		// REMOVED: UTXO validation during CheckTx to prevent deadlock
+		// UTXO validation will happen in DeliverTx instead
+		fmt.Printf("🔍 CheckTx: OK\n")
 		return abcitypes.ResponseCheckTx{Code: 0} // Accept
 	}
 
@@ -500,60 +527,69 @@ func (app *ShadowyApp) BeginBlock(req abcitypes.RequestBeginBlock) abcitypes.Res
 		fmt.Printf("🎯 Block %d challenge hash: %x\n", app.height, challengeHash)
 	}
 
-	// Try to generate a mining proof for this block if we have plots
-	var bestProof *ProofOfSpace = nil
-	if GetPlotCount() > 0 && len(app.nodePrivateKey) > 0 {
-		// Generate our mining proof using the node wallet's private key
-		proof, err := GenerateProofOfSpace(challengeHash, app.nodePrivateKey)
-		if err == nil {
-			bestProof = proof
-			if farmingDebugMode {
-				fmt.Printf("⛏️ Generated mining proof with distance: %d\n", proof.Distance)
-			}
-		} else if farmingDebugMode {
-			fmt.Printf("⚠️ Failed to generate mining proof: %v\n", err)
+	// IMPORTANT: For determinism, all nodes must execute the same coinbase
+	// We award the block proposer (from req.Header.ProposerAddress) to ensure
+	// all nodes compute the same state. In the future, we should include
+	// proof-of-space in block transactions for proper consensus.
+
+	// Convert proposer address to our Address type
+	// ProposerAddress is a CometBFT validator address (first 20 bytes of validator pubkey hash)
+	proposerAddr := req.Header.ProposerAddress
+	if len(proposerAddr) == 0 {
+		if farmingDebugMode {
+			fmt.Printf("⚠️ No proposer address in block header\n")
 		}
-	} else if farmingDebugMode {
-		if GetPlotCount() == 0 {
-			fmt.Printf("⚠️ No plot files available for mining\n")
-		} else {
-			fmt.Printf("⚠️ No node private key available for mining\n")
+		return abcitypes.ResponseBeginBlock{}
+	}
+
+	// DETERMINISTIC COINBASE AWARD - CRITICAL FOR CONSENSUS
+	// All nodes MUST award the same address or consensus will fail
+	//
+	// Look up validator's registered wallet address
+	// If not registered, use derived address (creates orphaned coins)
+
+	var minerAddress Address
+
+	// Try to get registered wallet address for this validator
+	if registeredAddr, err := app.utxoStore.GetValidatorWallet(proposerAddr); err == nil && registeredAddr != nil {
+		// Validator has registered their wallet address
+		minerAddress = *registeredAddr
+		if farmingDebugMode {
+			fmt.Printf("💰 Block proposer: %x\n", proposerAddr)
+			fmt.Printf("   ✅ Registered wallet: %s\n", minerAddress.String()[:40]+"...")
+		}
+	} else {
+		// Validator not registered - use derived address (orphaned coins)
+		proposerHash := blake2b.Sum256(proposerAddr)
+		copy(minerAddress[:], proposerHash[:])
+		if farmingDebugMode {
+			fmt.Printf("💰 Block proposer: %x\n", proposerAddr)
+			fmt.Printf("   ⚠️  UNREGISTERED - orphaned address: %s\n", minerAddress.String()[:40]+"...")
 		}
 	}
 
-	if bestProof != nil {
+	// Create coinbase transaction for mining reward
+	// Use block timestamp for determinism - all nodes must create identical transaction
+	blockReward := uint64(50 * 1e8) // 50 SHADOW tokens (8 decimals)
+	blockTimestamp := req.Header.Time.Unix()
+	coinbaseTx := CreateCoinbaseTransaction(minerAddress, uint64(app.height), blockReward, blockTimestamp)
+
+	// Execute the coinbase transaction to award the block reward
+	if err := executeTransaction(coinbaseTx, app.height, app.utxoStore); err != nil {
 		if farmingDebugMode {
-			fmt.Printf("🏆 Best mining proof found with distance: %d\n", bestProof.Distance)
-		}
-
-		// Create coinbase transaction for mining reward
-		blockReward := uint64(50 * 1e8) // 50 SHADOW tokens (8 decimals)
-
-		// Properly derive the miner address from the public key
-		minerPubKey := &mldsa87.PublicKey{}
-		if err := minerPubKey.UnmarshalBinary(bestProof.MinerPublicKey); err != nil {
-			if farmingDebugMode {
-				fmt.Printf("❌ Failed to unmarshal miner public key: %v\n", err)
-			}
-			// Fall back to node address on error
-			minerAddress := app.nodeAddress
-			coinbaseTx := CreateCoinbaseTransaction(minerAddress, uint64(app.height), blockReward)
-			_ = executeTransaction(coinbaseTx, app.height, app.utxoStore)
-		} else {
-			minerAddress := DeriveAddress(minerPubKey)
-			coinbaseTx := CreateCoinbaseTransaction(minerAddress, uint64(app.height), blockReward)
-
-			// Execute the coinbase transaction to award the miner
-			if err := executeTransaction(coinbaseTx, app.height, app.utxoStore); err != nil {
-				if farmingDebugMode {
-					fmt.Printf("❌ Failed to execute coinbase transaction: %v\n", err)
-				}
-			} else if farmingDebugMode {
-				fmt.Printf("💰 Block reward of %d SHADOWY awarded to miner: %s\n", blockReward, minerAddress.String())
-			}
+			fmt.Printf("❌ Failed to execute coinbase transaction: %v\n", err)
 		}
 	} else {
-		// No mining proofs - award block reward to node for testing
+		if farmingDebugMode {
+			fmt.Printf("✅ Block reward of %d SHADOW awarded\n", blockReward)
+		}
+		// Track this farmer's proof for validator set management
+		app.recordFarmingProof(minerAddress, app.height)
+	}
+
+	// Keep proof generation for future use, but don't use it for rewards yet
+	if false { // Disabled for now - will re-enable when we can include proofs in blocks
+		// No mining proofs - this code path is disabled
 		if farmingDebugMode {
 			fmt.Printf("⏳ Block %d created - awarding coinbase for testing\n", app.height)
 		}
@@ -564,15 +600,20 @@ func (app *ShadowyApp) BeginBlock(req abcitypes.RequestBeginBlock) abcitypes.Res
 		// Use the node's wallet address for coinbase rewards
 		minerAddress := app.nodeAddress
 
-		coinbaseTx := CreateCoinbaseTransaction(minerAddress, uint64(app.height), blockReward)
+		blockTimestamp := req.Header.Time.Unix()
+		coinbaseTx := CreateCoinbaseTransaction(minerAddress, uint64(app.height), blockReward, blockTimestamp)
 
 		// Execute the coinbase transaction
 		if err := executeTransaction(coinbaseTx, app.height, app.utxoStore); err != nil {
 			if farmingDebugMode {
 				fmt.Printf("❌ Failed to execute test coinbase transaction: %v\n", err)
 			}
-		} else if farmingDebugMode {
-			fmt.Printf("💰 Test block reward of %d awarded to address: %x\n", blockReward, minerAddress[:8])
+		} else {
+			if farmingDebugMode {
+				fmt.Printf("💰 Test block reward of %d awarded to address: %x\n", blockReward, minerAddress[:8])
+			}
+			// Track this farming activity
+			app.recordFarmingProof(minerAddress, app.height)
 		}
 	}
 
@@ -581,24 +622,62 @@ func (app *ShadowyApp) BeginBlock(req abcitypes.RequestBeginBlock) abcitypes.Res
 
 // DeliverTx executes transactions
 func (app *ShadowyApp) DeliverTx(req abcitypes.RequestDeliverTx) abcitypes.ResponseDeliverTx {
+	fmt.Printf("🔍 DeliverTx START\n")
+
 	// Try to parse as JSON transaction first
 	var tx Transaction
 	if err := json.Unmarshal(req.Tx, &tx); err == nil {
+		fmt.Printf("🔍 DeliverTx: Parsed transaction\n")
+
+		// Handle validator registration separately
+		if tx.TxType == TxTypeRegisterValidator {
+			fmt.Printf("🔍 DeliverTx: Processing validator registration\n")
+
+			// Data should contain: proposer_address (20 bytes) + wallet_address (32 bytes)
+			if len(tx.Data) != 52 {
+				fmt.Printf("🔍 DeliverTx: Invalid registration data length: %d\n", len(tx.Data))
+				return abcitypes.ResponseDeliverTx{
+					Code: 1,
+					Log:  fmt.Sprintf("Invalid validator registration data: expected 52 bytes, got %d", len(tx.Data)),
+				}
+			}
+
+			proposerAddr := tx.Data[:20]
+			var walletAddr Address
+			copy(walletAddr[:], tx.Data[20:52])
+
+			if err := app.utxoStore.RegisterValidator(proposerAddr, walletAddr); err != nil {
+				fmt.Printf("🔍 DeliverTx: Registration failed: %v\n", err)
+				return abcitypes.ResponseDeliverTx{
+					Code: 1,
+					Log:  fmt.Sprintf("Validator registration failed: %v", err),
+				}
+			}
+
+			fmt.Printf("🔍 DeliverTx: Validator registered successfully\n")
+			return abcitypes.ResponseDeliverTx{Code: 0}
+		}
+
 		// Standard Shadowy transaction - execute it
 		if err := ValidateTransaction(&tx); err != nil {
+			fmt.Printf("🔍 DeliverTx: Validation failed: %v\n", err)
 			return abcitypes.ResponseDeliverTx{
 				Code: 1,
 				Log:  fmt.Sprintf("Transaction validation failed: %v", err),
 			}
 		}
+		fmt.Printf("🔍 DeliverTx: Validation passed\n")
 
 		// Execute the transaction (update UTXO set, balances, etc.)
+		fmt.Printf("🔍 DeliverTx: About to execute transaction\n")
 		if err := executeTransaction(&tx, app.height, app.utxoStore); err != nil {
+			fmt.Printf("🔍 DeliverTx: Execution failed: %v\n", err)
 			return abcitypes.ResponseDeliverTx{
 				Code: 1,
 				Log:  fmt.Sprintf("Transaction execution failed: %v", err),
 			}
 		}
+		fmt.Printf("🔍 DeliverTx: Execution completed\n")
 
 		if farmingDebugMode {
 			fmt.Printf("🔄 Executed transaction: %s\n", GetTransactionSummary(&tx))
@@ -631,7 +710,21 @@ func (app *ShadowyApp) DeliverTx(req abcitypes.RequestDeliverTx) abcitypes.Respo
 
 // EndBlock handles end block
 func (app *ShadowyApp) EndBlock(req abcitypes.RequestEndBlock) abcitypes.ResponseEndBlock {
-	return abcitypes.ResponseEndBlock{}
+	// Check for validator set updates (promotions/demotions)
+	// TODO: TEMPORARILY DISABLED - validator updates causing consensus halt
+	// validatorUpdates := app.updateValidatorSet()
+
+	if farmingDebugMode {
+		// Just log what WOULD happen for debugging
+		updates := app.updateValidatorSet()
+		if len(updates) > 0 {
+			log.Printf("🔄 Would apply %d validator updates (disabled)", len(updates))
+		}
+	}
+
+	return abcitypes.ResponseEndBlock{
+		ValidatorUpdates: nil, // Disabled for now
+	}
 }
 
 // Commit commits state changes
@@ -754,36 +847,53 @@ func findBestProofInTransactions(txs [][]byte) *ProofOfSpace {
 
 // executeTransaction processes a transaction and updates state
 func executeTransaction(tx *Transaction, blockHeight int64, utxoStore *UTXOStore) error {
+	fmt.Printf("🔍 executeTransaction: START\n")
+
 	// Validate transaction against UTXO set
 	if utxoStore != nil {
+		fmt.Printf("🔍 executeTransaction: Validating against UTXO set\n")
 		if err := utxoStore.ValidateTransaction(tx); err != nil {
+			fmt.Printf("🔍 executeTransaction: UTXO validation failed: %v\n", err)
 			return fmt.Errorf("UTXO validation failed: %w", err)
 		}
+		fmt.Printf("🔍 executeTransaction: UTXO validation passed\n")
 	}
 
 	// Validate transaction signatures and structure
+	fmt.Printf("🔍 executeTransaction: Validating signatures\n")
 	if err := ValidateTransaction(tx); err != nil {
+		fmt.Printf("🔍 executeTransaction: Signature validation failed: %v\n", err)
 		return fmt.Errorf("transaction validation failed: %w", err)
 	}
+	fmt.Printf("🔍 executeTransaction: Signature validation passed\n")
 
 	// Update UTXO set if we have persistent storage
 	if utxoStore != nil {
 		// Spend input UTXOs (except for coinbase transactions)
 		if tx.TxType != TxTypeCoinbase {
-			for _, input := range tx.Inputs {
+			fmt.Printf("🔍 executeTransaction: Spending %d inputs\n", len(tx.Inputs))
+			for i, input := range tx.Inputs {
+				fmt.Printf("🔍 executeTransaction: Spending input %d/%d\n", i+1, len(tx.Inputs))
 				if err := utxoStore.SpendUTXO(input.PrevTxID, input.OutputIndex); err != nil {
+					fmt.Printf("🔍 executeTransaction: Failed to spend UTXO: %v\n", err)
 					return fmt.Errorf("failed to spend UTXO %s:%d: %w", input.PrevTxID, input.OutputIndex, err)
 				}
 			}
+			fmt.Printf("🔍 executeTransaction: All inputs spent\n")
 		}
 
 		// Create new UTXOs from outputs
+		fmt.Printf("🔍 executeTransaction: Getting transaction ID\n")
 		txID, err := tx.ID()
 		if err != nil {
+			fmt.Printf("🔍 executeTransaction: Failed to get TX ID: %v\n", err)
 			return fmt.Errorf("failed to get transaction ID: %w", err)
 		}
+		fmt.Printf("🔍 executeTransaction: TX ID = %s\n", txID)
 
+		fmt.Printf("🔍 executeTransaction: Creating %d outputs\n", len(tx.Outputs))
 		for i, output := range tx.Outputs {
+			fmt.Printf("🔍 executeTransaction: Creating output %d/%d\n", i+1, len(tx.Outputs))
 			utxo := &UTXO{
 				TxID:        txID,
 				OutputIndex: uint32(i),
@@ -793,15 +903,147 @@ func executeTransaction(tx *Transaction, blockHeight int64, utxoStore *UTXOStore
 			}
 
 			if err := utxoStore.AddUTXO(utxo); err != nil {
+				fmt.Printf("🔍 executeTransaction: Failed to add UTXO: %v\n", err)
 				return fmt.Errorf("failed to add UTXO %s:%d: %w", txID, i, err)
 			}
 		}
+		fmt.Printf("🔍 executeTransaction: All outputs created\n")
 
 		// Store the transaction
+		fmt.Printf("🔍 executeTransaction: Storing transaction\n")
 		if err := utxoStore.StoreTransaction(tx, blockHeight); err != nil {
+			fmt.Printf("🔍 executeTransaction: Failed to store transaction: %v\n", err)
 			return fmt.Errorf("failed to store transaction: %w", err)
+		}
+		fmt.Printf("🔍 executeTransaction: Transaction stored\n")
+	}
+
+	fmt.Printf("🔍 executeTransaction: COMPLETE\n")
+	return nil
+}
+
+// Farmer tracking and validator management methods
+
+const (
+	FarmerPrefix            = "farmer:" // farmer:{address} -> FarmerStats
+	MinProofsForPromotion   = 5         // Number of valid proofs needed to become validator
+	MaxBlocksWithoutProof   = 100       // Blocks without proof before demotion
+	DefaultValidatorPower   = 10        // Default voting power for farmers
+)
+
+// loadFarmerStats loads farmer statistics from persistent storage
+func (app *ShadowyApp) loadFarmerStats() {
+	if app.db == nil {
+		return
+	}
+
+	// Iterate through farmer records
+	iterator, err := app.db.Iterator([]byte(FarmerPrefix), nil)
+	if err != nil {
+		log.Printf("Warning: Failed to load farmer stats: %v", err)
+		return
+	}
+	defer iterator.Close()
+
+	loaded := 0
+	for ; iterator.Valid(); iterator.Next() {
+		var stats FarmerStats
+		if err := json.Unmarshal(iterator.Value(), &stats); err != nil {
+			continue
+		}
+		app.farmers[stats.Address.String()] = &stats
+		loaded++
+	}
+
+	if loaded > 0 {
+		log.Printf("Loaded %d farmer records from database", loaded)
+	}
+}
+
+// saveFarmerStats persists farmer statistics to database
+func (app *ShadowyApp) saveFarmerStats(stats *FarmerStats) error {
+	if app.db == nil {
+		return nil
+	}
+
+	key := fmt.Sprintf("%s%s", FarmerPrefix, stats.Address.String())
+	data, err := json.Marshal(stats)
+	if err != nil {
+		return err
+	}
+
+	return app.db.Set([]byte(key), data)
+}
+
+// recordFarmingProof records a valid farming proof submission
+func (app *ShadowyApp) recordFarmingProof(minerAddress Address, height int64) {
+	addrStr := minerAddress.String()
+	
+	stats, exists := app.farmers[addrStr]
+	if !exists {
+		stats = &FarmerStats{
+			Address:        minerAddress,
+			ProofCount:     0,
+			LastProofHeight: height,
+			IsValidator:    false,
+			ValidatorPower: 0,
+		}
+		app.farmers[addrStr] = stats
+	}
+
+	stats.ProofCount++
+	stats.LastProofHeight = height
+
+	// Save to database
+	if err := app.saveFarmerStats(stats); err != nil {
+		log.Printf("Warning: Failed to save farmer stats for %s: %v", addrStr, err)
+	}
+
+	if farmingDebugMode {
+		fmt.Printf("📊 Farmer %s now has %d proofs (last: block %d)\n", 
+			addrStr[:16], stats.ProofCount, height)
+	}
+}
+
+// updateValidatorSet checks for promotions/demotions and returns validator updates
+func (app *ShadowyApp) updateValidatorSet() []abcitypes.ValidatorUpdate {
+	var updates []abcitypes.ValidatorUpdate
+
+	for _, stats := range app.farmers {
+		// Check for promotion: enough proofs and not yet a validator
+		if !stats.IsValidator && stats.ProofCount >= MinProofsForPromotion {
+			// Promote to validator
+			stats.IsValidator = true
+			stats.ValidatorPower = DefaultValidatorPower
+
+			// Create validator update using helper (power > 0 = add)
+			// Use address bytes as public key identifier (Ed25519 expects 32 bytes)
+			update := abcitypes.Ed25519ValidatorUpdate(stats.Address[:], stats.ValidatorPower)
+			updates = append(updates, update)
+
+			log.Printf("🎖️  PROMOTED farmer %s to validator (proofs: %d)",
+				stats.Address.String()[:16], stats.ProofCount)
+
+			app.saveFarmerStats(stats)
+		}
+
+		// Check for demotion: validator with no recent proofs
+		if stats.IsValidator && (app.height - stats.LastProofHeight) > MaxBlocksWithoutProof {
+			// Demote from validator
+			stats.IsValidator = false
+			oldPower := stats.ValidatorPower
+			stats.ValidatorPower = 0
+
+			// Create validator update (power = 0 = remove)
+			update := abcitypes.Ed25519ValidatorUpdate(stats.Address[:], 0)
+			updates = append(updates, update)
+
+			log.Printf("⬇️  DEMOTED validator %s (no proof for %d blocks, had power: %d)", 
+				stats.Address.String()[:16], app.height - stats.LastProofHeight, oldPower)
+
+			app.saveFarmerStats(stats)
 		}
 	}
 
-	return nil
+	return updates
 }
