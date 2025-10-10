@@ -5,13 +5,11 @@ import (
 	"fmt"
 	"log"
 	"sync"
-
-	db "github.com/cometbft/cometbft-db"
 )
 
 // UTXOStore manages the UTXO set with persistent storage
 type UTXOStore struct {
-	db    db.DB
+	db    *BoltDBAdapter
 	mutex sync.RWMutex
 	cache map[string]*UTXO // In-memory cache for performance
 }
@@ -28,12 +26,17 @@ const (
 	ValidatorPrefix  = "val:"     // val:{proposer_address_hex} -> wallet_address
 )
 
-// NewUTXOStore creates a new UTXO store with the given database
-func NewUTXOStore(database db.DB) *UTXOStore {
-	return &UTXOStore{
-		db:    database,
-		cache: make(map[string]*UTXO),
+// NewUTXOStore creates a new UTXO store with the given database path
+func NewUTXOStore(dbPath string) (*UTXOStore, error) {
+	db, err := NewBoltDBAdapter(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open UTXO database: %w", err)
 	}
+
+	return &UTXOStore{
+		db:    db,
+		cache: make(map[string]*UTXO),
+	}, nil
 }
 
 // GetUTXO retrieves a UTXO by transaction ID and output index

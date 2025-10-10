@@ -38,8 +38,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Default to node mode (start blockchain node)
+	// Use --demo flag to run the old demo code instead
+	if !config.NodeMode {
+		// For now, just run node mode by default
+		config.NodeMode = true
+	}
+
 	// Check if running in node mode
 	if config.NodeMode {
+
 		if err := lib.StartNode(config); err != nil {
 			fmt.Fprintf(os.Stderr, "Node mode failed: %v\n", err)
 			os.Exit(1)

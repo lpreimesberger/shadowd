@@ -225,6 +225,13 @@ func (c *BlockSyncClient) SyncFromPeer(peerID peer.ID) error {
 
 		// Add blocks to our chain
 		for _, block := range blocks {
+			// Check if we already have this block (could have arrived via consensus during sync)
+			currentHeight := c.chain.GetHeight() - 1 // Convert to block index
+			if block.Index <= currentHeight {
+				fmt.Printf("[Sync] Skipping block %d (already have it)\n", block.Index)
+				continue
+			}
+
 			if err := c.chain.AddBlock(block); err != nil {
 				return fmt.Errorf("failed to add block %d: %w", block.Index, err)
 			}

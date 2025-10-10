@@ -13,8 +13,10 @@ import (
 )
 
 const (
-	ConsensusTopic  = "shadowy-consensus"
-	BlockInterval   = 10 * time.Second // Propose new block every 10 seconds
+	ConsensusTopic   = "shadowy-consensus"
+	ProofTopic       = "shadowy-proofs" // New topic for proof competition
+	BlockInterval    = 10 * time.Second // Propose new block every 10 seconds
+	ProofWindow      = 8 * time.Second  // Time window to collect proofs before block proposal
 	MinVoteThreshold = 0.5              // Need >50% of nodes to vote yes
 )
 
@@ -22,74 +24,117 @@ const (
 type ConsensusMessageType string
 
 const (
-	MsgTypeBlockProposal ConsensusMessageType = "block_proposal"
-	MsgTypeBlockVote     ConsensusMessageType = "block_vote"
-	MsgTypeBlockCommit   ConsensusMessageType = "block_commit"
+	MsgTypeBlockProposal   ConsensusMessageType = "block_proposal"
+	MsgTypeBlockVote       ConsensusMessageType = "block_vote"
+	MsgTypeBlockCommit     ConsensusMessageType = "block_commit"
+	MsgTypeProofSubmission ConsensusMessageType = "proof_submission"
 )
+
+// ProofSubmission represents a farmer's proof submission for a block
+type ProofSubmission struct {
+	BlockHeight   uint64        `json:"block_height"`
+	Proof         *ProofOfSpace `json:"proof"`
+	RewardAddress Address       `json:"reward_address"` // Where to send block reward
+	SubmitterID   string        `json:"submitter_id"`   // Node ID that submitted
+}
 
 // ConsensusMessage is the gossip message format for consensus
 type ConsensusMessage struct {
-	Type      ConsensusMessageType `json:"type"`
-	Proposal  *BlockProposal       `json:"proposal,omitempty"`
-	Vote      *BlockVote           `json:"vote,omitempty"`
-	Block     *Block               `json:"block,omitempty"`
-	Timestamp int64                `json:"timestamp"`
+	Type            ConsensusMessageType `json:"type"`
+	Proposal        *BlockProposal       `json:"proposal,omitempty"`
+	Vote            *BlockVote           `json:"vote,omitempty"`
+	Block           *Block               `json:"block,omitempty"`
+	ProofSubmission *ProofSubmission     `json:"proof_submission,omitempty"`
+	Timestamp       int64                `json:"timestamp"`
 }
 
 // ConsensusEngine manages blockchain consensus
 type ConsensusEngine struct {
-	chain      *Blockchain
-	mempool    *Mempool
-	pubsub     *pubsub.PubSub
-	topic      *pubsub.Topic
-	sub        *pubsub.Subscription
-	host       host.Host
-	nodeID     string
-	ctx        context.Context
-	cancel     context.CancelFunc
+	chain         *Blockchain
+	mempool       *Mempool
+	pubsub        *pubsub.PubSub
+	topic         *pubsub.Topic
+	sub           *pubsub.Subscription
+	proofTopic    *pubsub.Topic        // Topic for proof submissions
+	proofSub      *pubsub.Subscription // Subscription to proof topic
+	host          host.Host
+	nodeID        string
+	rewardAddress Address // Address to receive block rewards
+	ctx           context.Context
+	cancel        context.CancelFunc
+	wallet        *NodeWallet // Wallet for signing proofs
 
 	// Consensus state
-	isLeader         bool
-	leaderLock       sync.RWMutex
-	pendingProposal  *Block
-	proposalVotes    map[string]bool // voter -> vote
-	voteLock         sync.RWMutex
+	isLeader        bool
+	leaderLock      sync.RWMutex
+	pendingProposal *Block
+	proposalVotes   map[string]bool // voter -> vote
+	voteLock        sync.RWMutex
+
+	// Proof competition state
+	bestProofForHeight map[uint64]*ProofSubmission // Track best proof per height
+	proofLock          sync.RWMutex
 }
 
 // NewConsensusEngine creates a new consensus engine
-func NewConsensusEngine(chain *Blockchain, mempool *Mempool, h host.Host, ps *pubsub.PubSub) (*ConsensusEngine, error) {
+func NewConsensusEngine(chain *Blockchain, mempool *Mempool, h host.Host, ps *pubsub.PubSub, wallet *NodeWallet, rewardAddr Address) (*ConsensusEngine, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Join consensus topic
 	topic, err := ps.Join(ConsensusTopic)
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("failed to join topic: %w", err)
+		return nil, fmt.Errorf("failed to join consensus topic: %w", err)
 	}
 
-	// Subscribe
+	// Subscribe to consensus
 	sub, err := topic.Subscribe()
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("failed to subscribe: %w", err)
+		return nil, fmt.Errorf("failed to subscribe to consensus: %w", err)
+	}
+
+	// Join proof competition topic
+	proofTopic, err := ps.Join(ProofTopic)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to join proof topic: %w", err)
+	}
+
+	// Subscribe to proofs
+	proofSub, err := proofTopic.Subscribe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to subscribe to proofs: %w", err)
 	}
 
 	ce := &ConsensusEngine{
-		chain:      chain,
-		mempool:    mempool,
-		pubsub:     ps,
-		topic:      topic,
-		sub:        sub,
-		host:       h,
-		nodeID:     h.ID().String(),
-		ctx:        ctx,
-		cancel:     cancel,
-		isLeader:   false,
-		proposalVotes: make(map[string]bool),
+		chain:              chain,
+		mempool:            mempool,
+		rewardAddress:      rewardAddr,
+		pubsub:             ps,
+		topic:              topic,
+		sub:                sub,
+		proofTopic:         proofTopic,
+		proofSub:           proofSub,
+		host:               h,
+		nodeID:             h.ID().String(),
+		wallet:             wallet,
+		ctx:                ctx,
+		cancel:             cancel,
+		isLeader:           false,
+		proposalVotes:      make(map[string]bool),
+		bestProofForHeight: make(map[uint64]*ProofSubmission),
 	}
 
 	// Start listening for consensus messages
 	go ce.listenForMessages()
+
+	// Start listening for proof submissions
+	go ce.listenForProofs()
+
+	// Start farming loop (generate and submit proofs)
+	go ce.farmingLoop()
 
 	// Start simple leader election (for now, just use peer ID comparison)
 	go ce.leaderElection()
@@ -172,15 +217,46 @@ func (ce *ConsensusEngine) blockProposalLoop() {
 
 // proposeBlock creates and proposes a new block
 func (ce *ConsensusEngine) proposeBlock() {
+	currentHeight := ce.chain.GetHeight() + 1
+
+	// Get the best proof for this height
+	bestProof := ce.GetBestProof(currentHeight)
+	if bestProof == nil || bestProof.Proof == nil {
+		fmt.Printf("[Consensus] ⚠️  No proof available for height %d, skipping block proposal\n", currentHeight)
+		return
+	}
+
+	fmt.Printf("[Consensus] 🏆 Using winning proof with distance %d from %s\n",
+		bestProof.Proof.Distance, bestProof.SubmitterID[:16])
+
 	// Get transactions from mempool
 	txs := ce.mempool.GetTransactions()
-	txIDs := make([]string, 0, len(txs))
+	txIDs := []string{}
+	totalFees := uint64(0)
+
+	// Calculate total fees from transactions
 	for _, tx := range txs {
 		txID, err := tx.ID()
 		if err != nil {
 			continue
 		}
 		txIDs = append(txIDs, txID)
+
+		// Calculate fee: inputs - outputs
+		var inputTotal, outputTotal uint64
+		for _, input := range tx.Inputs {
+			// Get the UTXO being spent
+			utxo, err := ce.chain.GetUTXOStore().GetUTXO(input.PrevTxID, input.OutputIndex)
+			if err == nil && utxo != nil {
+				inputTotal += utxo.Output.Amount
+			}
+		}
+		for _, output := range tx.Outputs {
+			outputTotal += output.Amount
+		}
+		if inputTotal > outputTotal {
+			totalFees += (inputTotal - outputTotal)
+		}
 	}
 
 	// Limit to first 100 transactions
@@ -188,8 +264,20 @@ func (ce *ConsensusEngine) proposeBlock() {
 		txIDs = txIDs[:100]
 	}
 
-	// Create block proposal
-	block := ce.chain.ProposeBlock(txIDs, ce.nodeID)
+	// Create coinbase transaction - reward goes to proof WINNER not proposer!
+	blockReward := uint64(50_000_000) // 50 SHADOW base reward
+	coinbaseTx := NewTxBuilder(TxTypeCoinbase)
+	coinbaseTx.SetTimestamp(time.Now().Unix())
+	coinbaseTx.AddOutput(bestProof.RewardAddress, blockReward+totalFees, "SHADOW")
+	coinbase := coinbaseTx.Build()
+
+	coinbaseID, _ := coinbase.ID()
+	txIDs = append([]string{coinbaseID}, txIDs...) // Prepend coinbase
+
+	// Create block proposal (includes coinbase + winning proof)
+	block := ce.chain.ProposeBlock(txIDs, ce.nodeID, coinbase)
+	block.WinningProof = bestProof.Proof
+	block.WinnerAddress = &bestProof.RewardAddress
 
 	// Store as pending proposal
 	ce.voteLock.Lock()
@@ -348,7 +436,13 @@ func (ce *ConsensusEngine) handleBlockVote(vote *BlockVote) {
 		peerCount = 2 // Minimum for testing
 	}
 
-	if totalVotes >= peerCount && float64(yesVotes)/float64(totalVotes) > MinVoteThreshold {
+	// Require votes from a majority of nodes (more than half)
+	requiredVotes := (peerCount / 2) + 1
+	threshold := float64(yesVotes) / float64(totalVotes)
+	fmt.Printf("[Consensus] Quorum check: totalVotes=%d >= requiredVotes=%d ? %v, threshold=%.2f > 0.5 ? %v\n",
+		totalVotes, requiredVotes, totalVotes >= requiredVotes, threshold, threshold > MinVoteThreshold)
+
+	if totalVotes >= requiredVotes && float64(yesVotes)/float64(totalVotes) > MinVoteThreshold {
 		fmt.Printf("[Consensus] ✓ Block %d approved! Committing...\n", ce.pendingProposal.Index)
 		ce.commitBlock(ce.pendingProposal)
 	}
@@ -419,9 +513,156 @@ func (ce *ConsensusEngine) publishMessage(msg ConsensusMessage) {
 	}
 }
 
+// farmingLoop continuously farms for proofs and submits them
+func (ce *ConsensusEngine) farmingLoop() {
+	ticker := time.NewTicker(2 * time.Second) // Check every 2 seconds
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ce.ctx.Done():
+			return
+		case <-ticker.C:
+			// Get current challenge
+			challenge := ce.chain.GetCurrentChallenge()
+			currentHeight := ce.chain.GetHeight() + 1
+
+			// Check if we already have plots loaded
+			if GetPlotCount() == 0 {
+				// No plots available, skip farming
+				continue
+			}
+
+			// Marshal private key for proof generation
+			privKeyBytes, err := ce.wallet.KeyPair.PrivateKey.MarshalBinary()
+			if err != nil {
+				fmt.Printf("[Farming] Failed to marshal private key: %v\n", err)
+				continue
+			}
+
+			// Generate proof for this challenge
+			proof, err := GenerateProofOfSpace(challenge, privKeyBytes)
+			if err != nil {
+				fmt.Printf("[Farming] Failed to generate proof: %v\n", err)
+				continue
+			}
+
+			// Check if this proof is better than what we've seen
+			ce.proofLock.RLock()
+			bestProof := ce.bestProofForHeight[currentHeight]
+			ce.proofLock.RUnlock()
+
+			isBetter := false
+			if bestProof == nil || proof.Distance < bestProof.Proof.Distance {
+				isBetter = true
+			}
+
+			if isBetter {
+				fmt.Printf("[Farming] 🌾 Found proof with distance %d for height %d\n", proof.Distance, currentHeight)
+
+				// Submit our proof
+				submission := &ProofSubmission{
+					BlockHeight:   currentHeight,
+					Proof:         proof,
+					RewardAddress: ce.rewardAddress,
+					SubmitterID:   ce.nodeID,
+				}
+
+				// Track locally
+				ce.proofLock.Lock()
+				ce.bestProofForHeight[currentHeight] = submission
+				ce.proofLock.Unlock()
+
+				// Gossip to network
+				msg := ConsensusMessage{
+					Type:            MsgTypeProofSubmission,
+					ProofSubmission: submission,
+					Timestamp:       time.Now().Unix(),
+				}
+
+				data, err := json.Marshal(msg)
+				if err == nil {
+					ce.proofTopic.Publish(ce.ctx, data)
+				}
+			}
+		}
+	}
+}
+
+// listenForProofs listens for proof submissions from other nodes
+func (ce *ConsensusEngine) listenForProofs() {
+	fmt.Printf("[Farming] 👂 Listening for proof submissions on topic: %s\n", ProofTopic)
+
+	for {
+		msg, err := ce.proofSub.Next(ce.ctx)
+		if err != nil {
+			if ce.ctx.Err() != nil {
+				return
+			}
+			fmt.Printf("[Farming] Error reading proof message: %v\n", err)
+			continue
+		}
+
+		// Skip our own messages
+		if msg.ReceivedFrom == ce.host.ID() {
+			continue
+		}
+
+		var consensusMsg ConsensusMessage
+		if err := json.Unmarshal(msg.Data, &consensusMsg); err != nil {
+			fmt.Printf("[Farming] Failed to decode proof message: %v\n", err)
+			continue
+		}
+
+		if consensusMsg.Type == MsgTypeProofSubmission {
+			ce.handleProofSubmission(consensusMsg.ProofSubmission)
+		}
+	}
+}
+
+// handleProofSubmission processes a received proof submission
+func (ce *ConsensusEngine) handleProofSubmission(submission *ProofSubmission) {
+	if submission == nil || submission.Proof == nil {
+		return
+	}
+
+	// Validate the proof cryptographically
+	if !ValidateProofOfSpace(submission.Proof) {
+		fmt.Printf("[Farming] ❌ Invalid proof from %s\n", submission.SubmitterID[:16])
+		return
+	}
+
+	// Check if this is for current or near-future height
+	currentHeight := ce.chain.GetHeight() + 1
+	if submission.BlockHeight < currentHeight || submission.BlockHeight > currentHeight+2 {
+		// Too old or too far in future
+		return
+	}
+
+	// Check if this proof is better than what we have
+	ce.proofLock.Lock()
+	defer ce.proofLock.Unlock()
+
+	bestProof := ce.bestProofForHeight[submission.BlockHeight]
+	if bestProof == nil || submission.Proof.Distance < bestProof.Proof.Distance {
+		fmt.Printf("[Farming] 🏆 New best proof for height %d: distance=%d from %s\n",
+			submission.BlockHeight, submission.Proof.Distance, submission.SubmitterID[:16])
+		ce.bestProofForHeight[submission.BlockHeight] = submission
+	}
+}
+
+// GetBestProof returns the best proof seen for a given height
+func (ce *ConsensusEngine) GetBestProof(height uint64) *ProofSubmission {
+	ce.proofLock.RLock()
+	defer ce.proofLock.RUnlock()
+	return ce.bestProofForHeight[height]
+}
+
 // Close shuts down the consensus engine
 func (ce *ConsensusEngine) Close() error {
 	ce.cancel()
 	ce.sub.Cancel()
-	return ce.topic.Close()
+	ce.proofSub.Cancel()
+	ce.topic.Close()
+	return ce.proofTopic.Close()
 }

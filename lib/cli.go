@@ -18,6 +18,8 @@ type CLIConfig struct {
 	Dirs          []string `mapstructure:"dirs" json:"dirs"`                     // Directories containing plot/proof files
 	NodeMode      bool     `mapstructure:"node_mode" json:"node_mode"`           // Run in node mode (HTTP server + console)
 	BlockchainDir string   `mapstructure:"blockchain_dir" json:"blockchain_dir"` // Directory for blockchain data (Tendermint files)
+	P2PPort       int      `mapstructure:"p2p_port" json:"p2p_port"`             // P2P listen port
+	APIPort       int      `mapstructure:"api_port" json:"api_port"`             // API/HTTP listen port
 }
 
 // SeedNode represents a parsed seed node
@@ -50,6 +52,8 @@ func ParseCLI() (*CLIConfig, error) {
 	viper.SetDefault("dirs", []string{})
 	viper.SetDefault("node_mode", false)
 	viper.SetDefault("blockchain_dir", "./blockchain")
+	viper.SetDefault("p2p_port", 9000)
+	viper.SetDefault("api_port", 8080)
 
 	// Define command line flags
 	quietFlag := flag.Bool("quiet", false, "Suppress verbose output (especially Tendermint debug info)")
@@ -57,6 +61,8 @@ func ParseCLI() (*CLIConfig, error) {
 	dirsFlag := flag.String("dirs", "", "Comma-delimited list of directories containing plot/proof files")
 	nodeFlag := flag.Bool("node", false, "Run in node mode (starts HTTP server, Tendermint, and interactive console)")
 	blockchainDirFlag := flag.String("blockchain-dir", "", "Directory for blockchain data (Tendermint files), defaults to ./blockchain")
+	p2pPortFlag := flag.Int("p2p-port", 9000, "P2P listen port (default: 9000)")
+	apiPortFlag := flag.Int("api-port", 8080, "API/HTTP listen port (default: 8080)")
 
 	// Parse command line
 	flag.Parse()
@@ -101,6 +107,14 @@ func ParseCLI() (*CLIConfig, error) {
 
 	if *blockchainDirFlag != "" {
 		viper.Set("blockchain_dir", *blockchainDirFlag)
+	}
+
+	if *p2pPortFlag != 9000 {
+		viper.Set("p2p_port", *p2pPortFlag)
+	}
+
+	if *apiPortFlag != 8080 {
+		viper.Set("api_port", *apiPortFlag)
 	}
 
 	// Unmarshal config into struct

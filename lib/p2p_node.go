@@ -79,7 +79,7 @@ func NewP2PBlockchainNode(p2pPort, apiPort int) (*P2PBlockchainNode, error) {
 	}
 
 	// Create consensus engine with shared gossip (AFTER sync)
-	consensus, err := NewConsensusEngine(chain, mempool, p2p.Host, ps)
+	consensus, err := NewConsensusEngine(chain, mempool, p2p.Host, ps, wallet, wallet.Address)
 	if err != nil {
 		p2p.Close()
 		mempool.Close()
@@ -131,6 +131,17 @@ func (n *P2PBlockchainNode) startAPI() {
 
 	// Consensus status
 	mux.HandleFunc("/api/consensus/status", n.handleConsensusStatus)
+
+	// Balance and UTXO query
+	mux.HandleFunc("/api/balance", n.handleGetBalance)
+	mux.HandleFunc("/api/utxos", n.handleGetUTXOs)
+	mux.HandleFunc("/api/transactions", n.handleGetTransactions)
+	mux.HandleFunc("/api/transactions/send", n.handleSendTransaction) // Alias for /api/tx/send
+
+	// Node and wallet info
+	mux.HandleFunc("/api/status", n.handleGetStatus)
+	mux.HandleFunc("/api/wallet/info", n.handleGetWalletInfo)
+	mux.HandleFunc("/api/tokens", n.handleGetTokens)
 
 	// Health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -211,7 +222,10 @@ func (n *P2PBlockchainNode) handleSendTransaction(w http.ResponseWriter, r *http
 	var req struct {
 		ToAddress string `json:"to_address"`
 		Amount    uint64 `json:"amount"`
-		Token     string `json:"token"`
+		Token     string `json:"token"`      // Legacy field
+		TokenID   string `json:"token_id"`   // API spec field
+		Fee       uint64 `json:"fee"`        // Optional fee
+		Memo      string `json:"memo"`       // Optional memo
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -226,15 +240,109 @@ func (n *P2PBlockchainNode) handleSendTransaction(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Create transaction
-	builder := NewTxBuilder(TxTypeSend)
-	builder.SetTimestamp(time.Now().Unix())
-	builder.AddOutput(toAddr, req.Amount, req.Token)
-	tx := builder.Build()
+	// Use SHADOW token if not specified
+	// Support both "token" (legacy) and "token_id" (API spec)
+	tokenID := req.TokenID
+	if tokenID == "" {
+		tokenID = req.Token
+	}
+	if tokenID == "" || tokenID == "SHADOW" {
+		tokenID = GetGenesisToken().TokenID
+	}
 
-	// Sign it
+	// Get UTXOs for our wallet
+	utxos, err := n.Chain.GetUTXOStore().GetUTXOsByAddress(n.Wallet.Address)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get UTXOs: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Filter for unspent UTXOs of the requested token
+	var availableUTXOs []*UTXO
+	for _, utxo := range utxos {
+		if !utxo.IsSpent && utxo.Output.TokenID == tokenID {
+			availableUTXOs = append(availableUTXOs, utxo)
+		}
+	}
+
+	// Determine the fee to use
+	// If custom fee provided, use it. Otherwise estimate based on inputs
+	var targetFee uint64
+	if req.Fee > 0 {
+		targetFee = req.Fee
+	} else {
+		targetFee = 1000 // Default from API spec
+	}
+
+	// Select UTXOs to cover the amount + fee
+	var selectedUTXOs []*UTXO
+	var total uint64
+	for _, utxo := range availableUTXOs {
+		selectedUTXOs = append(selectedUTXOs, utxo)
+		total += utxo.Output.Amount
+		// If no custom fee, recalculate based on inputs selected
+		if req.Fee == 0 {
+			targetFee = uint64(len(selectedUTXOs)) * 1150
+			if targetFee < 11500 {
+				targetFee = 11500
+			}
+		}
+		if total >= req.Amount+targetFee {
+			break
+		}
+	}
+
+	// Final check with actual fee
+	if req.Fee == 0 {
+		targetFee = uint64(len(selectedUTXOs)) * 1150
+		if targetFee < 11500 {
+			targetFee = 11500
+		}
+	}
+	if total < req.Amount+targetFee {
+		http.Error(w, fmt.Sprintf("Insufficient balance: have %d, need %d (including %d fee)", total, req.Amount+targetFee, targetFee), http.StatusBadRequest)
+		return
+	}
+
+	// Create transaction manually to support memo
+	txBuilder := NewTxBuilder(TxTypeSend)
+	txBuilder.SetTimestamp(time.Now().Unix())
+
+	// Add inputs
+	for _, utxo := range selectedUTXOs {
+		txBuilder.AddInput(utxo.TxID, utxo.OutputIndex)
+	}
+
+	// Add output to recipient
+	txBuilder.AddOutput(toAddr, req.Amount, tokenID)
+
+	// Add change output if needed
+	change := total - req.Amount - targetFee
+	if change > 0 {
+		txBuilder.AddOutput(n.Wallet.Address, change, tokenID)
+	}
+
+	tx := txBuilder.Build()
+
+	// Add memo if provided
+	if req.Memo != "" {
+		// Validate memo is ASCII and max 64 bytes
+		if len(req.Memo) > 64 {
+			http.Error(w, "Memo must be <= 64 bytes", http.StatusBadRequest)
+			return
+		}
+		for _, c := range req.Memo {
+			if c > 127 {
+				http.Error(w, "Memo must be ASCII only", http.StatusBadRequest)
+				return
+			}
+		}
+		tx.Data = []byte(req.Memo)
+	}
+
+	// Sign the transaction
 	if err := n.Wallet.SignTransaction(tx); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to sign: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Failed to sign transaction: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -321,6 +429,233 @@ func (n *P2PBlockchainNode) handleConsensusStatus(w http.ResponseWriter, r *http
 		"is_leader": n.Consensus.IsLeader(),
 		"node_id":   n.Consensus.nodeID,
 		"height":    n.Chain.GetHeight(),
+	})
+}
+
+// handleGetBalance returns the balance and UTXOs for an address
+func (n *P2PBlockchainNode) handleGetBalance(w http.ResponseWriter, r *http.Request) {
+	// Get address from query parameter or use node's own address
+	addrStr := r.URL.Query().Get("address")
+	if addrStr == "" {
+		addrStr = n.Wallet.Address.String()
+	}
+
+	// Parse address
+	addr, _, err := ParseAddress(addrStr)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid address: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Get UTXOs for this address
+	utxos, err := n.Chain.GetUTXOStore().GetUTXOsByAddress(addr)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get UTXOs: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Calculate balance by token
+	balanceMap := make(map[string]uint64)
+	utxoList := []map[string]interface{}{}
+
+	for _, utxo := range utxos {
+		if !utxo.IsSpent {
+			// Add to balance
+			balanceMap[utxo.Output.TokenID] += utxo.Output.Amount
+
+			// Add to UTXO list
+			utxoList = append(utxoList, map[string]interface{}{
+				"tx_id":        utxo.TxID,
+				"output_index": utxo.OutputIndex,
+				"amount":       utxo.Output.Amount,
+				"token_id":     utxo.Output.TokenID,
+				"block_height": utxo.BlockHeight,
+			})
+		}
+	}
+
+	// Convert balance map to array with token details
+	balances := []map[string]interface{}{}
+	for tokenID, balance := range balanceMap {
+		tokenInfo := map[string]interface{}{
+			"token_id": tokenID,
+			"balance":  balance,
+		}
+
+		// Add token metadata (for now, only support SHADOW genesis token)
+		if tokenID == GetGenesisToken().TokenID || tokenID == "SHADOW" {
+			genesis := GetGenesisToken()
+			tokenInfo["name"] = genesis.Name
+			tokenInfo["ticker"] = genesis.Ticker
+			tokenInfo["decimals"] = genesis.Decimals
+		} else {
+			// For unknown tokens, provide defaults
+			tokenInfo["name"] = "Unknown Token"
+			tokenInfo["ticker"] = "???"
+			tokenInfo["decimals"] = 8
+		}
+
+		balances = append(balances, tokenInfo)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"address":  addrStr,
+		"balances": balances,
+		"utxos":    utxoList,
+		"count":    len(utxoList),
+	})
+}
+
+// handleGetUTXOs returns UTXOs for an address
+func (n *P2PBlockchainNode) handleGetUTXOs(w http.ResponseWriter, r *http.Request) {
+	// Get address from query parameter or use node's own address
+	addrStr := r.URL.Query().Get("address")
+	if addrStr == "" {
+		addrStr = n.Wallet.Address.String()
+	}
+
+	// Parse address
+	addr, _, err := ParseAddress(addrStr)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid address: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Get UTXOs for this address
+	utxos, err := n.Chain.GetUTXOStore().GetUTXOsByAddress(addr)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get UTXOs: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Build UTXO list
+	utxoList := []map[string]interface{}{}
+	for _, utxo := range utxos {
+		if !utxo.IsSpent {
+			utxoList = append(utxoList, map[string]interface{}{
+				"tx_id":        utxo.TxID,
+				"output_index": utxo.OutputIndex,
+				"amount":       utxo.Output.Amount,
+				"token_id":     utxo.Output.TokenID,
+				"address":      utxo.Output.Address.String(),
+				"block_height": utxo.BlockHeight,
+				"is_spent":     utxo.IsSpent,
+			})
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"address": addrStr,
+		"utxos":   utxoList,
+		"count":   len(utxoList),
+	})
+}
+
+// handleGetTransactions returns transaction history for an address
+func (n *P2PBlockchainNode) handleGetTransactions(w http.ResponseWriter, r *http.Request) {
+	// Get address from query parameter or use node's own address
+	addrStr := r.URL.Query().Get("address")
+	if addrStr == "" {
+		addrStr = n.Wallet.Address.String()
+	}
+
+	// Parse address
+	addr, _, err := ParseAddress(addrStr)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid address: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Get UTXOs to find transactions involving this address
+	utxos, err := n.Chain.GetUTXOStore().GetUTXOsByAddress(addr)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get transactions: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Build transaction list (deduplicate by tx_id)
+	txMap := make(map[string]map[string]interface{})
+	for _, utxo := range utxos {
+		if _, exists := txMap[utxo.TxID]; !exists {
+			// Get the full transaction from the block
+			block := n.Chain.GetBlock(utxo.BlockHeight)
+			if block != nil {
+				// For now, just return basic info
+				txMap[utxo.TxID] = map[string]interface{}{
+					"tx_id":        utxo.TxID,
+					"block_height": utxo.BlockHeight,
+					"timestamp":    block.Timestamp,
+				}
+			}
+		}
+	}
+
+	// Convert map to slice
+	txList := []map[string]interface{}{}
+	for _, tx := range txMap {
+		txList = append(txList, tx)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"address":      addrStr,
+		"transactions": txList,
+		"count":        len(txList),
+	})
+}
+
+// handleGetStatus returns node status information
+func (n *P2PBlockchainNode) handleGetStatus(w http.ResponseWriter, r *http.Request) {
+	peers := n.P2P.GetPeers()
+	peerStrs := make([]string, len(peers))
+	for i, p := range peers {
+		peerStrs[i] = p.String()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"node_id": n.P2P.Host.ID().String(),
+		"wallet_info": map[string]string{
+			"address": n.Wallet.Address.String(),
+		},
+		"genesis_token": map[string]interface{}{
+			"token_id": GetGenesisToken().TokenID,
+			"name":     GetGenesisToken().Name,
+			"symbol":   GetGenesisToken().Ticker,
+			"decimals": GetGenesisToken().Decimals,
+		},
+		"chain_height":     n.Chain.GetHeight(),
+		"peers":            peerStrs,
+		"peer_count":       len(peers),
+		"http_server_addr": fmt.Sprintf("http://localhost:%d", n.apiPort),
+		"is_leader":        n.Consensus.IsLeader(),
+	})
+}
+
+// handleGetWalletInfo returns wallet information
+func (n *P2PBlockchainNode) handleGetWalletInfo(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"address": n.Wallet.Address.String(),
+	})
+}
+
+// handleGetTokens returns token registry information
+func (n *P2PBlockchainNode) handleGetTokens(w http.ResponseWriter, r *http.Request) {
+	genesisToken := GetGenesisToken()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"count": 1,
+		"genesis_token": map[string]interface{}{
+			"token_id":    genesisToken.TokenID,
+			"name":        genesisToken.Name,
+			"symbol":      genesisToken.Ticker,
+			"decimals":    genesisToken.Decimals,
+			"description": "The native token of the Shadowy post-quantum blockchain",
+		},
 	})
 }
 

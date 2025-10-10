@@ -13,7 +13,6 @@ import (
 
 	"golang.org/x/crypto/blake2b"
 
-	db "github.com/cometbft/cometbft-db"
 	abcitypes "github.com/cometbft/cometbft/abci/types"
 	"github.com/cometbft/cometbft/config"
 	tmlog "github.com/cometbft/cometbft/libs/log"
@@ -407,19 +406,11 @@ type ShadowyApp struct {
 
 // NewShadowyApp creates a new Shadowy ABCI application
 func NewShadowyApp(nodeAddress Address) *ShadowyApp {
-	// Create persistent database for UTXO storage
-	// Use LevelDB for production-ready persistence
-	var database db.DB
-	levelDB, err := db.NewGoLevelDB("utxo", "data")
+	// Create persistent database for UTXO storage using BadgerDB
+	utxoStore, err := NewUTXOStore("data/utxo")
 	if err != nil {
-		// Fallback to memory database if file system issues
-		log.Printf("Warning: Failed to create persistent database, using memory: %v", err)
-		database = db.NewMemDB()
-	} else {
-		database = levelDB
+		log.Fatalf("Failed to create UTXO store: %v", err)
 	}
-
-	utxoStore := NewUTXOStore(database)
 
 	// Migrate existing coinbase transactions from UTXOs
 	if err := utxoStore.MigrateCoinbaseTransactions(); err != nil {
