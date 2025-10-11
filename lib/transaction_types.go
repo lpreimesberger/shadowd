@@ -103,13 +103,13 @@ func CreateMintTokenTransactionFromTokenInfo(tokenInfo *TokenInfo, mintAmount ui
 		TokenID:      tokenInfo.TokenID,
 		TokenType:    "custom",
 		ScriptPubKey: CreateP2PKHScript(recipientAddress),
-		Data:         []byte(fmt.Sprintf("token:%s", tokenInfo.Name)),
+		Data:         []byte(fmt.Sprintf("token:%s", tokenInfo.Ticker)),
 	}
 
 	builder.AddCustomOutput(tokenOutput)
 
 	// Add token creation data with staking requirement
-	stakingRequired := tokenInfo.CalculateStakingRequirement(mintAmount)
+	stakingRequired := tokenInfo.CalculateStakingRequirement()
 	tokenData := fmt.Sprintf("token_mint_%s_%d_stake_%d", tokenInfo.TokenID, mintAmount, stakingRequired)
 	builder.SetData([]byte(tokenData))
 

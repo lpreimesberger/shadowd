@@ -3,7 +3,6 @@ package lib
 import (
     "crypto/sha256"
     "encoding/ascii85"
-    "encoding/hex"
     "encoding/json"
     "fmt"
     "log"
@@ -131,7 +130,6 @@ func GenerateProofOfSpace(challengeHash [32]byte, minerPrivateKey []byte) (*Proo
 
     // Sign the plot proof data with the miner's key
     minerSignature := make([]byte, mldsa87.SignatureSize)
-    fmt.Printf("validating: %s", string(plotProofData))
     mldsa87.SignTo(minerPrivateKeyObj, plotProofData, nil, false, minerSignature)
 
     // Get the public key from the private key

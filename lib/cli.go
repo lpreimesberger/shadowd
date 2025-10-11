@@ -13,13 +13,15 @@ import (
 
 // CLIConfig holds the parsed command line configuration
 type CLIConfig struct {
-	Quiet         bool     `mapstructure:"quiet" json:"quiet"`                   // Suppress verbose output (especially Tendermint debug info)
-	Seeds         []string `mapstructure:"seeds" json:"seeds"`                   // List of seed nodes in format nodeid@ip_address
-	Dirs          []string `mapstructure:"dirs" json:"dirs"`                     // Directories containing plot/proof files
-	NodeMode      bool     `mapstructure:"node_mode" json:"node_mode"`           // Run in node mode (HTTP server + console)
-	BlockchainDir string   `mapstructure:"blockchain_dir" json:"blockchain_dir"` // Directory for blockchain data (Tendermint files)
-	P2PPort       int      `mapstructure:"p2p_port" json:"p2p_port"`             // P2P listen port
-	APIPort       int      `mapstructure:"api_port" json:"api_port"`             // API/HTTP listen port
+	Quiet                 bool     `mapstructure:"quiet" json:"quiet"`                                       // Suppress verbose output (especially Tendermint debug info)
+	Seeds                 []string `mapstructure:"seeds" json:"seeds"`                                       // List of seed nodes in format nodeid@ip_address
+	Dirs                  []string `mapstructure:"dirs" json:"dirs"`                                         // Directories containing plot/proof files
+	NodeMode              bool     `mapstructure:"node_mode" json:"node_mode"`                               // Run in node mode (HTTP server + console)
+	BlockchainDir         string   `mapstructure:"blockchain_dir" json:"blockchain_dir"`                     // Directory for blockchain data (Tendermint files)
+	P2PPort               int      `mapstructure:"p2p_port" json:"p2p_port"`                                 // P2P listen port
+	APIPort               int      `mapstructure:"api_port" json:"api_port"`                                 // API/HTTP listen port
+	MempoolTxExpiryBlocks int      `mapstructure:"mempool_tx_expiry_blocks" json:"mempool_tx_expiry_blocks"` // Blocks before tx expires from mempool (default: 2048)
+	MempoolMaxSizeMB      int      `mapstructure:"mempool_max_size_mb" json:"mempool_max_size_mb"`           // Maximum mempool size in MB (default: 300)
 }
 
 // SeedNode represents a parsed seed node
@@ -54,6 +56,8 @@ func ParseCLI() (*CLIConfig, error) {
 	viper.SetDefault("blockchain_dir", "./blockchain")
 	viper.SetDefault("p2p_port", 9000)
 	viper.SetDefault("api_port", 8080)
+	viper.SetDefault("mempool_tx_expiry_blocks", 2048)
+	viper.SetDefault("mempool_max_size_mb", 300)
 
 	// Define command line flags
 	quietFlag := flag.Bool("quiet", false, "Suppress verbose output (especially Tendermint debug info)")
@@ -128,11 +132,13 @@ func ParseCLI() (*CLIConfig, error) {
 // createDefaultConfig creates a default shadow.json configuration file
 func createDefaultConfig() error {
 	defaultConfig := &CLIConfig{
-		Quiet:         false,
-		Seeds:         []string{},
-		Dirs:          []string{"./plots"},
-		NodeMode:      false,
-		BlockchainDir: "./blockchain",
+		Quiet:                 false,
+		Seeds:                 []string{},
+		Dirs:                  []string{"./plots"},
+		NodeMode:              false,
+		BlockchainDir:         "./blockchain",
+		MempoolTxExpiryBlocks: 2048,
+		MempoolMaxSizeMB:      300,
 	}
 
 	viper.Set("quiet", defaultConfig.Quiet)
@@ -140,6 +146,8 @@ func createDefaultConfig() error {
 	viper.Set("dirs", defaultConfig.Dirs)
 	viper.Set("node_mode", defaultConfig.NodeMode)
 	viper.Set("blockchain_dir", defaultConfig.BlockchainDir)
+	viper.Set("mempool_tx_expiry_blocks", defaultConfig.MempoolTxExpiryBlocks)
+	viper.Set("mempool_max_size_mb", defaultConfig.MempoolMaxSizeMB)
 
 	// Write config file
 	if err := viper.WriteConfigAs("shadow.json"); err != nil {

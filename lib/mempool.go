@@ -15,15 +15,26 @@ const (
 	MempoolTopic = "shadowy-mempool"
 )
 
+// MempoolEntry tracks a transaction and its metadata
+type MempoolEntry struct {
+	Tx             *Transaction
+	AddedAtBlock   uint64    // Block height when tx was added
+	AddedTimestamp time.Time // Timestamp when tx was added
+	SizeBytes      int       // Approximate size in bytes
+}
+
 // Mempool represents a shared transaction mempool
 type Mempool struct {
-	transactions map[string]*Transaction // txID -> transaction
-	txLock       sync.RWMutex
-	pubsub       *pubsub.PubSub
-	topic        *pubsub.Topic
-	sub          *pubsub.Subscription
-	ctx          context.Context
-	cancel       context.CancelFunc
+	entries       map[string]*MempoolEntry // txID -> entry
+	txLock        sync.RWMutex
+	pubsub        *pubsub.PubSub
+	topic         *pubsub.Topic
+	sub           *pubsub.Subscription
+	ctx           context.Context
+	cancel        context.CancelFunc
+	expiryBlocks  int // Transactions expire after this many blocks
+	maxSizeBytes  int // Maximum mempool size in bytes
+	currentHeight uint64
 }
 
 // MempoolMessage is the gossip message format
@@ -34,7 +45,7 @@ type MempoolMessage struct {
 }
 
 // NewMempool creates a new mempool with gossip support
-func NewMempool(h host.Host, ps *pubsub.PubSub) (*Mempool, error) {
+func NewMempool(h host.Host, ps *pubsub.PubSub, expiryBlocks int, maxSizeMB int) (*Mempool, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Join the mempool topic
@@ -52,18 +63,21 @@ func NewMempool(h host.Host, ps *pubsub.PubSub) (*Mempool, error) {
 	}
 
 	mp := &Mempool{
-		transactions: make(map[string]*Transaction),
-		pubsub:       ps,
-		topic:        topic,
-		sub:          sub,
-		ctx:          ctx,
-		cancel:       cancel,
+		entries:       make(map[string]*MempoolEntry),
+		pubsub:        ps,
+		topic:         topic,
+		sub:           sub,
+		ctx:           ctx,
+		cancel:        cancel,
+		expiryBlocks:  expiryBlocks,
+		maxSizeBytes:  maxSizeMB * 1024 * 1024, // Convert MB to bytes
+		currentHeight: 0,
 	}
 
 	// Start listening for mempool messages
 	go mp.listenForMessages()
 
-	fmt.Printf("[Mempool] Created and listening on topic: %s\n", MempoolTopic)
+	fmt.Printf("[Mempool] Created: expiry=%d blocks, maxSize=%dMB\n", expiryBlocks, maxSizeMB)
 	return mp, nil
 }
 
@@ -106,10 +120,20 @@ func (mp *Mempool) listenForMessages() {
 
 				mp.txLock.Lock()
 				// Only add if we don't already have it (avoid duplicates)
-				if _, exists := mp.transactions[txID]; !exists {
-					mp.transactions[txID] = mempoolMsg.Transaction
+				if _, exists := mp.entries[txID]; !exists {
+					txSize := mp.estimateTxSize(mempoolMsg.Transaction)
+					entry := &MempoolEntry{
+						Tx:             mempoolMsg.Transaction,
+						AddedAtBlock:   mp.currentHeight,
+						AddedTimestamp: time.Now(),
+						SizeBytes:      txSize,
+					}
+					mp.entries[txID] = entry
 					fmt.Printf("[Mempool] Added transaction from gossip: %s (total: %d)\n",
-						txID, len(mp.transactions))
+						txID, len(mp.entries))
+
+					// Check if we need to evict old transactions
+					mp.enforceMemoryLimitLocked()
 				}
 				mp.txLock.Unlock()
 			}
@@ -156,12 +180,23 @@ func (mp *Mempool) AddTransaction(tx *Transaction) error {
 
 	mp.txLock.Lock()
 	// Check if we already have it
-	if _, exists := mp.transactions[txID]; exists {
+	if _, exists := mp.entries[txID]; exists {
 		mp.txLock.Unlock()
 		return fmt.Errorf("transaction already in mempool")
 	}
-	mp.transactions[txID] = tx
-	txCount := len(mp.transactions)
+
+	txSize := mp.estimateTxSize(tx)
+	entry := &MempoolEntry{
+		Tx:             tx,
+		AddedAtBlock:   mp.currentHeight,
+		AddedTimestamp: time.Now(),
+		SizeBytes:      txSize,
+	}
+	mp.entries[txID] = entry
+	txCount := len(mp.entries)
+
+	// Check if we need to evict old transactions
+	mp.enforceMemoryLimitLocked()
 	mp.txLock.Unlock()
 
 	fmt.Printf("[Mempool] Added transaction locally: %s (total: %d)\n", txID, txCount)
@@ -191,9 +226,9 @@ func (mp *Mempool) GetTransactions() []*Transaction {
 	mp.txLock.RLock()
 	defer mp.txLock.RUnlock()
 
-	txs := make([]*Transaction, 0, len(mp.transactions))
-	for _, tx := range mp.transactions {
-		txs = append(txs, tx)
+	txs := make([]*Transaction, 0, len(mp.entries))
+	for _, entry := range mp.entries {
+		txs = append(txs, entry.Tx)
 	}
 	return txs
 }
@@ -203,8 +238,11 @@ func (mp *Mempool) GetTransaction(txID string) (*Transaction, bool) {
 	mp.txLock.RLock()
 	defer mp.txLock.RUnlock()
 
-	tx, exists := mp.transactions[txID]
-	return tx, exists
+	entry, exists := mp.entries[txID]
+	if !exists {
+		return nil, false
+	}
+	return entry.Tx, true
 }
 
 // RemoveTransaction removes a transaction from the mempool (e.g., after including in block)
@@ -212,15 +250,15 @@ func (mp *Mempool) RemoveTransaction(txID string) {
 	mp.txLock.Lock()
 	defer mp.txLock.Unlock()
 
-	delete(mp.transactions, txID)
-	fmt.Printf("[Mempool] Removed transaction: %s (remaining: %d)\n", txID, len(mp.transactions))
+	delete(mp.entries, txID)
+	fmt.Printf("[Mempool] Removed transaction: %s (remaining: %d)\n", txID, len(mp.entries))
 }
 
 // Count returns the number of transactions in the mempool
 func (mp *Mempool) Count() int {
 	mp.txLock.RLock()
 	defer mp.txLock.RUnlock()
-	return len(mp.transactions)
+	return len(mp.entries)
 }
 
 // PrintStatus prints the current mempool status
@@ -228,9 +266,17 @@ func (mp *Mempool) PrintStatus() {
 	mp.txLock.RLock()
 	defer mp.txLock.RUnlock()
 
-	fmt.Printf("\n[Mempool] Status: %d transactions\n", len(mp.transactions))
-	for txID, tx := range mp.transactions {
-		fmt.Printf("  - %s (type: %d, outputs: %d)\n", txID, tx.TxType, len(tx.Outputs))
+	totalSize := 0
+	for _, entry := range mp.entries {
+		totalSize += entry.SizeBytes
+	}
+
+	fmt.Printf("\n[Mempool] Status: %d transactions, %.2f MB / %d MB\n",
+		len(mp.entries), float64(totalSize)/(1024*1024), mp.maxSizeBytes/(1024*1024))
+	for txID, entry := range mp.entries {
+		age := mp.currentHeight - entry.AddedAtBlock
+		fmt.Printf("  - %s (type: %d, outputs: %d, age: %d blocks)\n",
+			txID, entry.Tx.TxType, len(entry.Tx.Outputs), age)
 	}
 	fmt.Println()
 }
@@ -240,4 +286,109 @@ func (mp *Mempool) Close() error {
 	mp.cancel()
 	mp.sub.Cancel()
 	return mp.topic.Close()
+}
+
+// UpdateBlockHeight updates the current block height and triggers expiration cleanup
+func (mp *Mempool) UpdateBlockHeight(height uint64) {
+	mp.txLock.Lock()
+	defer mp.txLock.Unlock()
+
+	mp.currentHeight = height
+	mp.cleanupExpiredTransactionsLocked()
+}
+
+// cleanupExpiredTransactionsLocked removes transactions older than expiryBlocks
+// Must be called with txLock held
+func (mp *Mempool) cleanupExpiredTransactionsLocked() {
+	if mp.expiryBlocks <= 0 {
+		return
+	}
+
+	var expiredTxs []string
+	for txID, entry := range mp.entries {
+		age := mp.currentHeight - entry.AddedAtBlock
+		if age >= uint64(mp.expiryBlocks) {
+			expiredTxs = append(expiredTxs, txID)
+		}
+	}
+
+	if len(expiredTxs) > 0 {
+		for _, txID := range expiredTxs {
+			delete(mp.entries, txID)
+		}
+		fmt.Printf("[Mempool] Expired %d transactions (age >= %d blocks)\n", len(expiredTxs), mp.expiryBlocks)
+	}
+}
+
+// enforceMemoryLimitLocked evicts oldest transactions if mempool exceeds size limit
+// Must be called with txLock held
+func (mp *Mempool) enforceMemoryLimitLocked() {
+	if mp.maxSizeBytes <= 0 {
+		return
+	}
+
+	// Calculate current size
+	currentSize := 0
+	for _, entry := range mp.entries {
+		currentSize += entry.SizeBytes
+	}
+
+	if currentSize <= mp.maxSizeBytes {
+		return
+	}
+
+	// Need to evict - sort entries by timestamp (oldest first)
+	type entryWithID struct {
+		txID  string
+		entry *MempoolEntry
+	}
+
+	entries := make([]entryWithID, 0, len(mp.entries))
+	for txID, entry := range mp.entries {
+		entries = append(entries, entryWithID{txID, entry})
+	}
+
+	// Sort by timestamp (oldest first)
+	for i := 0; i < len(entries)-1; i++ {
+		for j := i + 1; j < len(entries); j++ {
+			if entries[i].entry.AddedTimestamp.After(entries[j].entry.AddedTimestamp) {
+				entries[i], entries[j] = entries[j], entries[i]
+			}
+		}
+	}
+
+	// Evict oldest until we're under the limit
+	evictedCount := 0
+	for _, e := range entries {
+		if currentSize <= mp.maxSizeBytes {
+			break
+		}
+		delete(mp.entries, e.txID)
+		currentSize -= e.entry.SizeBytes
+		evictedCount++
+	}
+
+	if evictedCount > 0 {
+		fmt.Printf("[Mempool] Evicted %d oldest transactions to enforce %d MB limit\n",
+			evictedCount, mp.maxSizeBytes/(1024*1024))
+	}
+}
+
+// estimateTxSize estimates the size of a transaction in bytes
+func (mp *Mempool) estimateTxSize(tx *Transaction) int {
+	// Rough estimate: count inputs, outputs, and signature
+	size := 100 // Base overhead
+
+	// Inputs (UTXO references)
+	size += len(tx.Inputs) * 100
+
+	// Outputs
+	for _, output := range tx.Outputs {
+		size += 100 + len(output.Address)
+	}
+
+	// Signature
+	size += len(tx.Signature)
+
+	return size
 }

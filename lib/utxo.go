@@ -61,8 +61,11 @@ type TxOutput struct {
 	Address Address `json:"address"` // Recipient address
 
 	// Token information
-	TokenID   string `json:"token_id"`   // Token identifier ("SHADOW" for base token)
+	TokenID   string `json:"token_id"`   // Token identifier (genesis hash for SHADOW, TX ID for custom tokens)
 	TokenType string `json:"token_type"` // Token type descriptor
+
+	// Token staking (for custom tokens only)
+	LockedShadow uint64 `json:"locked_shadow,omitempty"` // Proportional SHADOW locked to this token UTXO
 
 	// Locking script
 	ScriptPubKey []byte `json:"script_pub_key"` // Locking script (for future smart contracts)

@@ -21,7 +21,7 @@ type P2PBlockchainNode struct {
 }
 
 // NewP2PBlockchainNode creates a new blockchain node
-func NewP2PBlockchainNode(p2pPort, apiPort int) (*P2PBlockchainNode, error) {
+func NewP2PBlockchainNode(p2pPort, apiPort int, config *CLIConfig) (*P2PBlockchainNode, error) {
 	// Create P2P node
 	p2p, err := NewP2PNode(p2pPort)
 	if err != nil {
@@ -36,8 +36,16 @@ func NewP2PBlockchainNode(p2pPort, apiPort int) (*P2PBlockchainNode, error) {
 		return nil, fmt.Errorf("failed to create gossipsub: %w", err)
 	}
 
-	// Create mempool with shared gossip
-	mempool, err := NewMempool(p2p.Host, ps)
+	// Create mempool with expiration and size limits from config
+	expiryBlocks := config.MempoolTxExpiryBlocks
+	maxSizeMB := config.MempoolMaxSizeMB
+	if expiryBlocks <= 0 {
+		expiryBlocks = 2048 // Default
+	}
+	if maxSizeMB <= 0 {
+		maxSizeMB = 300 // Default
+	}
+	mempool, err := NewMempool(p2p.Host, ps, expiryBlocks, maxSizeMB)
 	if err != nil {
 		p2p.Close()
 		return nil, fmt.Errorf("failed to create mempool: %w", err)
@@ -141,7 +149,12 @@ func (n *P2PBlockchainNode) startAPI() {
 	// Node and wallet info
 	mux.HandleFunc("/api/status", n.handleGetStatus)
 	mux.HandleFunc("/api/wallet/info", n.handleGetWalletInfo)
+
+	// Token endpoints
 	mux.HandleFunc("/api/tokens", n.handleGetTokens)
+	mux.HandleFunc("/api/token/info", n.handleGetTokenInfo)
+	mux.HandleFunc("/api/token/mint", n.handleMintToken)
+	mux.HandleFunc("/api/token/melt", n.handleMeltToken)
 
 	// Health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -485,9 +498,9 @@ func (n *P2PBlockchainNode) handleGetBalance(w http.ResponseWriter, r *http.Requ
 		// Add token metadata (for now, only support SHADOW genesis token)
 		if tokenID == GetGenesisToken().TokenID || tokenID == "SHADOW" {
 			genesis := GetGenesisToken()
-			tokenInfo["name"] = genesis.Name
+			tokenInfo["name"] = genesis.Ticker // Use ticker as name
 			tokenInfo["ticker"] = genesis.Ticker
-			tokenInfo["decimals"] = genesis.Decimals
+			tokenInfo["decimals"] = genesis.MaxDecimals
 		} else {
 			// For unknown tokens, provide defaults
 			tokenInfo["name"] = "Unknown Token"
@@ -622,9 +635,9 @@ func (n *P2PBlockchainNode) handleGetStatus(w http.ResponseWriter, r *http.Reque
 		},
 		"genesis_token": map[string]interface{}{
 			"token_id": GetGenesisToken().TokenID,
-			"name":     GetGenesisToken().Name,
+			"name":     GetGenesisToken().Ticker,
 			"symbol":   GetGenesisToken().Ticker,
-			"decimals": GetGenesisToken().Decimals,
+			"decimals": GetGenesisToken().MaxDecimals,
 		},
 		"chain_height":     n.Chain.GetHeight(),
 		"peers":            peerStrs,
@@ -644,18 +657,217 @@ func (n *P2PBlockchainNode) handleGetWalletInfo(w http.ResponseWriter, r *http.R
 
 // handleGetTokens returns token registry information
 func (n *P2PBlockchainNode) handleGetTokens(w http.ResponseWriter, r *http.Request) {
-	genesisToken := GetGenesisToken()
+	registry := GetGlobalTokenRegistry()
+	tokens := registry.ListTokens()
+
+	tokenList := make([]map[string]interface{}, 0)
+	for _, token := range tokens {
+		tokenList = append(tokenList, map[string]interface{}{
+			"token_id":     token.TokenID,
+			"ticker":       token.Ticker,
+			"description":  token.Desc,
+			"max_mint":     token.MaxMint,
+			"max_decimals": token.MaxDecimals,
+			"total_supply": token.TotalSupply,
+			"locked_shadow": token.LockedShadow,
+			"total_melted":  token.TotalMelted,
+			"creator":       token.CreatorAddress.String(),
+			"is_shadow":     token.IsBaseToken(),
+			"fully_melted":  token.IsFullyMelted(),
+		})
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"count": 1,
-		"genesis_token": map[string]interface{}{
-			"token_id":    genesisToken.TokenID,
-			"name":        genesisToken.Name,
-			"symbol":      genesisToken.Ticker,
-			"decimals":    genesisToken.Decimals,
-			"description": "The native token of the Shadowy post-quantum blockchain",
-		},
+		"count":  len(tokenList),
+		"tokens": tokenList,
+	})
+}
+
+func (n *P2PBlockchainNode) handleGetTokenInfo(w http.ResponseWriter, r *http.Request) {
+	tokenID := r.URL.Query().Get("token_id")
+	if tokenID == "" {
+		http.Error(w, "token_id parameter required", http.StatusBadRequest)
+		return
+	}
+
+	registry := GetGlobalTokenRegistry()
+	token, exists := registry.GetToken(tokenID)
+	if !exists {
+		http.Error(w, "token not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"token_id":      token.TokenID,
+		"ticker":        token.Ticker,
+		"description":   token.Desc,
+		"max_mint":      token.MaxMint,
+		"max_decimals":  token.MaxDecimals,
+		"total_supply":  token.TotalSupply,
+		"locked_shadow": token.LockedShadow,
+		"total_melted":  token.TotalMelted,
+		"creator":       token.CreatorAddress.String(),
+		"creation_time": token.CreationTime,
+		"is_shadow":     token.IsBaseToken(),
+		"fully_melted":  token.IsFullyMelted(),
+		"supply_formatted": token.FormatSupply(),
+	})
+}
+
+func (n *P2PBlockchainNode) handleMintToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST method required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Ticker      string `json:"ticker"`
+		Description string `json:"description"`
+		MaxMint     uint64 `json:"max_mint"`
+		MaxDecimals uint8  `json:"max_decimals"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Get SHADOW UTXOs for staking
+	shadowTokenID := GetGenesisToken().TokenID
+	utxos, err := n.Chain.utxoStore.GetUTXOsByAddress(n.Wallet.Address)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to get UTXOs: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Filter for SHADOW UTXOs
+	var shadowUTXOs []*UTXO
+	for _, utxo := range utxos {
+		if utxo.Output.TokenID == shadowTokenID {
+			shadowUTXOs = append(shadowUTXOs, utxo)
+		}
+	}
+
+	// Create mint transaction
+	tx, err := CreateTokenMintTransaction(
+		n.Wallet.Address,
+		shadowUTXOs,
+		req.Ticker,
+		req.Description,
+		req.MaxMint,
+		req.MaxDecimals,
+	)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to create mint transaction: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Sign transaction
+	if err := n.Wallet.SignTransaction(tx); err != nil {
+		http.Error(w, fmt.Sprintf("failed to sign transaction: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Broadcast transaction
+	if err := n.Mempool.AddTransaction(tx); err != nil {
+		http.Error(w, fmt.Sprintf("failed to broadcast transaction: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	txID, _ := tx.ID()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"tx_id":    txID,
+		"token_id": txID, // Token ID = TX ID for minting
+		"message":  fmt.Sprintf("Token %s minting transaction broadcast", req.Ticker),
+	})
+}
+
+func (n *P2PBlockchainNode) handleMeltToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST method required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		TokenID string `json:"token_id"`
+		Amount  uint64 `json:"amount"` // Amount to melt (0 = melt all)
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Get token UTXOs
+	utxos, err := n.Chain.utxoStore.GetUTXOsByAddress(n.Wallet.Address)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to get UTXOs: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Filter for this token
+	var tokenUTXOs []*UTXO
+	totalTokens := uint64(0)
+	for _, utxo := range utxos {
+		if utxo.Output.TokenID == req.TokenID {
+			tokenUTXOs = append(tokenUTXOs, utxo)
+			totalTokens += utxo.Output.Amount
+		}
+	}
+
+	if len(tokenUTXOs) == 0 {
+		http.Error(w, "no UTXOs found for this token", http.StatusBadRequest)
+		return
+	}
+
+	// If amount is 0, melt everything
+	meltAmount := req.Amount
+	if meltAmount == 0 {
+		meltAmount = totalTokens
+	}
+
+	if meltAmount > totalTokens {
+		http.Error(w, fmt.Sprintf("insufficient tokens: have %d, want to melt %d", totalTokens, meltAmount), http.StatusBadRequest)
+		return
+	}
+
+	// Create melt transaction
+	tx, err := CreateTokenMeltTransaction(
+		tokenUTXOs,
+		meltAmount,
+		n.Wallet.Address, // Change back to us
+		n.Wallet.Address, // Unlocked SHADOW to us
+	)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to create melt transaction: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Sign transaction
+	if err := n.Wallet.SignTransaction(tx); err != nil {
+		http.Error(w, fmt.Sprintf("failed to sign transaction: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Broadcast transaction
+	if err := n.Mempool.AddTransaction(tx); err != nil {
+		http.Error(w, fmt.Sprintf("failed to broadcast transaction: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	txID, _ := tx.ID()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":      true,
+		"tx_id":        txID,
+		"melted_amount": meltAmount,
+		"message":       fmt.Sprintf("Melted %d tokens", meltAmount),
 	})
 }
 

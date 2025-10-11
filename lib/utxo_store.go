@@ -312,6 +312,79 @@ func (store *UTXOStore) Close() error {
 	return nil
 }
 
+// ProcessTokenTransaction handles token-specific transaction processing (mint/melt)
+func (store *UTXOStore) ProcessTokenTransaction(tx *Transaction, tokenRegistry *TokenRegistry) error {
+	if tx == nil || tokenRegistry == nil {
+		return nil
+	}
+
+	txID, _ := tx.ID()
+
+	switch tx.TxType {
+	case TxTypeMintToken:
+		// Extract token metadata from transaction
+		var mintData TokenMintData
+		if err := json.Unmarshal(tx.Data, &mintData); err != nil {
+			return fmt.Errorf("failed to parse mint data: %w", err)
+		}
+
+		// Create TokenInfo and register it
+		tokenInfo, err := CreateCustomToken(
+			mintData.Ticker,
+			mintData.Desc,
+			mintData.MaxMint,
+			mintData.MaxDecimals,
+			tx.Outputs[0].Address, // Creator is first output address
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create token info: %w", err)
+		}
+
+		// Set token ID to this TX ID
+		tokenInfo.SetTokenID(txID)
+
+		// Register the token
+		if err := tokenRegistry.RegisterToken(tokenInfo); err != nil {
+			return fmt.Errorf("failed to register token: %w", err)
+		}
+
+	case TxTypeMelt:
+		// Find the token being melted and update total melted
+		for _, output := range tx.Outputs {
+			// Find SHADOW output - this tells us how much was melted
+			if output.TokenID == GetGenesisToken().TokenID {
+				// Figure out which token was melted from inputs
+				if len(tx.Inputs) > 0 {
+					firstInput := tx.Inputs[0]
+					inputUTXO, err := store.GetUTXO(firstInput.PrevTxID, firstInput.OutputIndex)
+					if err == nil && inputUTXO != nil {
+						tokenID := inputUTXO.Output.TokenID
+						// Calculate melted amount (input tokens - output token change)
+						meltedAmount := uint64(0)
+						for _, input := range tx.Inputs {
+							utxo, err := store.GetUTXO(input.PrevTxID, input.OutputIndex)
+							if err == nil && utxo != nil {
+								meltedAmount += utxo.Output.Amount
+							}
+						}
+						// Subtract any token change
+						for _, out := range tx.Outputs {
+							if out.TokenID == tokenID {
+								meltedAmount -= out.Amount
+							}
+						}
+						// Record the melt
+						tokenRegistry.RecordMelt(tokenID, meltedAmount)
+					}
+				}
+				break
+			}
+		}
+	}
+
+	return nil
+}
+
 // StoreTransaction stores a transaction and indexes it by addresses involved
 func (store *UTXOStore) StoreTransaction(tx *Transaction, height int64) error {
 	store.mutex.Lock()

@@ -89,7 +89,7 @@ func main() {
 
 	genesisToken := lib.GetGenesisToken()
 	if !config.Quiet {
-		fmt.Printf("   Genesis Token: %s (%s)\n", genesisToken.Name, genesisToken.Ticker)
+		fmt.Printf("   Genesis Token: %s (%s)\n", genesisToken.Ticker, genesisToken.Desc)
 		fmt.Printf("   Token ID: %s\n", genesisToken.TokenID)
 		fmt.Printf("   Total Supply: %s\n", genesisToken.FormatSupply())
 		fmt.Printf("   Token registry initialized with %d tokens\n", tokenRegistry.GetTokenCount())
@@ -195,21 +195,20 @@ func main() {
 
 	// Create TokenInfo for the custom token
 	customTokenInfo, err := lib.CreateCustomToken(
-		"ShadowCoin",            // name
 		"SCOIN",                 // ticker
-		100000000000,            // total supply (1000 tokens with 8 decimals)
-		8,                       // decimals
-		50000000,                // melt value per token (0.5 SHADOW per token)
+		"ShadowCoin",            // desc
+		1000,                    // max_mint (1000 base units)
+		8,                       // max_decimals (8 decimals)
 		nodeWallet.GetAddress(), // creator
 	)
 	if err != nil {
 		log.Fatal("Failed to create custom token info:", err)
 	}
 
-	conditionalPrintf(config, "   Custom Token: %s (%s)\n", customTokenInfo.Name, customTokenInfo.Ticker)
-	conditionalPrintf(config, "   Token ID: %s\n", customTokenInfo.TokenID)
+	conditionalPrintf(config, "   Custom Token: %s (%s)\n", customTokenInfo.Ticker, customTokenInfo.Desc)
+	conditionalPrintf(config, "   Token ID: (will be set on minting)\n")
 	conditionalPrintf(config, "   Total Supply: %s\n", customTokenInfo.FormatSupply())
-	conditionalPrintf(config, "   Melt Value: %s SHADOW per token\n", lib.FormatAmount(customTokenInfo.MeltValuePerToken))
+	conditionalPrintf(config, "   Locked SHADOW: %s\n", lib.FormatAmount(customTokenInfo.LockedShadow))
 
 	// Register the token
 	err = tokenRegistry.RegisterToken(customTokenInfo)
@@ -232,7 +231,7 @@ func main() {
 		conditionalPrintf(config, "   Minted: %s to %s\n",
 			lib.FormatAmount(mintAmount), recipient.Address().String()[:16]+"...")
 
-		stakingReq := customTokenInfo.CalculateStakingRequirement(mintAmount)
+		stakingReq := customTokenInfo.CalculateStakingRequirement()
 		conditionalPrintf(config, "   Staking required: %s SHADOW\n", lib.FormatAmount(stakingReq))
 	}
 

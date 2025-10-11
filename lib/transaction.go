@@ -287,9 +287,14 @@ func validateSendTransaction(tx *Transaction) error {
 
 // validateMintTokenTransaction validates token minting transactions
 func validateMintTokenTransaction(tx *Transaction) error {
-	// Must have at least one output
+	// Basic validation - must have at least one output
 	if len(tx.Outputs) == 0 {
 		return fmt.Errorf("mint token transaction must have outputs")
+	}
+
+	// Must have Data field with mint parameters
+	if len(tx.Data) == 0 {
+		return fmt.Errorf("mint transaction must have token metadata in Data field")
 	}
 
 	// At least one output should be a custom token
@@ -320,11 +325,39 @@ func validateMeltTransaction(tx *Transaction) error {
 		return fmt.Errorf("melt transaction must have inputs")
 	}
 
-	// May or may not have outputs (could destroy everything)
+	// May or may not have outputs (could destroy everything or have change)
 
 	// Must be signed
 	if len(tx.Signature) == 0 {
 		return fmt.Errorf("melt transaction must be signed")
+	}
+
+	return nil
+}
+
+// ValidateTransactionWithContext validates a transaction with full blockchain context
+// This includes UTXO validation and token registry checks
+func ValidateTransactionWithContext(tx *Transaction, utxoStore *UTXOStore, tokenRegistry *TokenRegistry) error {
+	// First do basic validation
+	if err := ValidateTransaction(tx); err != nil {
+		return err
+	}
+
+	// Type-specific context validation
+	switch tx.TxType {
+	case TxTypeMintToken:
+		// Use the comprehensive mint validation
+		if tokenRegistry != nil {
+			return ValidateTokenMintTransaction(tx, tokenRegistry)
+		}
+	case TxTypeMelt:
+		// Use the comprehensive melt validation
+		if utxoStore != nil {
+			return ValidateTokenMeltTransaction(tx, utxoStore)
+		}
+	case TxTypeSend:
+		// TODO: Validate UTXO inputs exist and are spendable
+		// For now, basic validation is enough
 	}
 
 	return nil

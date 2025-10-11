@@ -1,7 +1,6 @@
 package lib
 
 import (
-	"encoding/json"
 	"fmt"
 	"regexp"
 	"time"
@@ -11,21 +10,24 @@ import (
 
 // TokenInfo represents complete token metadata for the blockchain
 type TokenInfo struct {
+	// Token ID - for custom tokens, this is the TX ID of the minting transaction
+	TokenID string `json:"token_id"` // Transaction ID that created this token (or genesis hash)
+
 	// Human-readable information
-	Name   string `json:"name"`   // ASCII only, max 64 characters
-	Ticker string `json:"ticker"` // ASCII only, max 16 characters
+	Ticker string `json:"ticker"` // 3-32 chars, [A-Za-z0-9] only
+	Desc   string `json:"desc"`   // 0-64 chars, [A-Za-z0-9] only (optional description)
 
 	// Token economics
-	TotalSupply       uint64 `json:"total_supply"`         // Total token supply (in smallest unit)
-	Decimals          uint8  `json:"decimals"`             // Number of decimal places
-	MeltValuePerToken uint64 `json:"melt_value_per_token"` // Base currency returned per token when melted
+	MaxMint       uint64 `json:"max_mint"`       // Maximum base units (before decimals), max 21 million
+	MaxDecimals   uint8  `json:"max_decimals"`   // Number of decimal places (0-8 for SHADOW decimals)
+	TotalSupply   uint64 `json:"total_supply"`   // Total token supply in smallest unit (MaxMint * 10^MaxDecimals)
+	LockedShadow  uint64 `json:"locked_shadow"`  // SHADOW satoshis locked (1:1 with TotalSupply for custom tokens)
+	TotalMelted   uint64 `json:"total_melted"`   // Total tokens melted (for tracking when ticker can be reused)
+	MintVersion   uint8  `json:"mint_version"`   // Version of minting logic (currently 0)
 
 	// Creation metadata
 	CreatorAddress Address `json:"creator_address"` // Address that created this token
-	CreationTime   int64   `json:"creation_time"`   // GMT creation timestamp for uniqueness
-
-	// Computed identifier (not serialized in hash calculation)
-	TokenID string `json:"token_id,omitempty"` // SHAKE256 hash of serialized data
+	CreationTime   int64   `json:"creation_time"`   // Unix timestamp when created
 }
 
 // GenesisTokenInfo creates the base SHADOW token for the network
@@ -36,124 +38,119 @@ func GenesisTokenInfo() *TokenInfo {
 	// Fixed genesis creation time for deterministic token ID
 	genesisTime := int64(1704067200) // 2024-01-01 00:00:00 GMT
 
+	maxMint := uint64(21_000_000)  // 21 million base units
+	maxDecimals := uint8(8)        // 8 decimal places
+	totalSupply := uint64(2_100_000_000_000_000) // 21M * 10^8
+
 	tokenInfo := &TokenInfo{
-		Name:              "Shadow",
-		Ticker:            "SHADOW",
-		TotalSupply:       2100000000000000, // 21 million SHADOW with 8 decimals
-		Decimals:          8,
-		MeltValuePerToken: 0, // Base currency has no melt value
-		CreatorAddress:    genesisAddr,
-		CreationTime:      genesisTime,
+		TokenID:        calculateGenesisTokenID(), // Deterministic genesis hash
+		Ticker:         "SHADOW",
+		Desc:           "Base token for Shadow Network",
+		MaxMint:        maxMint,
+		MaxDecimals:    maxDecimals,
+		TotalSupply:    totalSupply,
+		LockedShadow:   0, // Base token doesn't lock SHADOW
+		TotalMelted:    0, // No tokens melted yet
+		MintVersion:    0,
+		CreatorAddress: genesisAddr,
+		CreationTime:   genesisTime,
 	}
 
-	// Calculate token ID
-	tokenID, err := tokenInfo.CalculateTokenID()
-	if err != nil {
-		panic(fmt.Sprintf("Failed to calculate genesis token ID: %v", err))
-	}
-
-	tokenInfo.TokenID = tokenID
 	return tokenInfo
 }
 
-// CalculateTokenID computes the SHAKE256 hash of the serialized token data
-func (ti *TokenInfo) CalculateTokenID() (string, error) {
-	// Create a copy without the TokenID field for hashing
-	hashData := struct {
-		Name              string  `json:"name"`
-		Ticker            string  `json:"ticker"`
-		TotalSupply       uint64  `json:"total_supply"`
-		Decimals          uint8   `json:"decimals"`
-		MeltValuePerToken uint64  `json:"melt_value_per_token"`
-		CreatorAddress    Address `json:"creator_address"`
-		CreationTime      int64   `json:"creation_time"`
-	}{
-		Name:              ti.Name,
-		Ticker:            ti.Ticker,
-		TotalSupply:       ti.TotalSupply,
-		Decimals:          ti.Decimals,
-		MeltValuePerToken: ti.MeltValuePerToken,
-		CreatorAddress:    ti.CreatorAddress,
-		CreationTime:      ti.CreationTime,
-	}
+// calculateGenesisTokenID creates a deterministic token ID for genesis SHADOW token
+func calculateGenesisTokenID() string {
+	// Use deterministic hash based on genesis parameters
+	// This ensures SHADOW token ID is stable across code changes
+	genesisTime := int64(1704067200) // 2024-01-01 00:00:00 GMT
+	maxMint := uint64(21_000_000)
+	maxDecimals := uint8(8)
+	ticker := "SHADOW"
 
-	// Serialize to JSON for consistent hashing
-	jsonData, err := json.Marshal(hashData)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal token info: %w", err)
-	}
-
-	// Use SHAKE256 with 32-byte output (same as SHA256 length)
+	// Hash the genesis parameters
+	hashInput := fmt.Sprintf("%s_%d_%d_%d", ticker, genesisTime, maxMint, maxDecimals)
 	hash := make([]byte, 32)
-	sha3.ShakeSum256(hash, jsonData)
-
-	return fmt.Sprintf("%x", hash), nil
+	sha3.ShakeSum256(hash, []byte(hashInput))
+	return fmt.Sprintf("%x", hash)
 }
 
-// Validate checks if the token info is valid
+// IsFullyMelted returns true if all tokens have been melted
+func (ti *TokenInfo) IsFullyMelted() bool {
+	return ti.TotalMelted >= ti.TotalSupply
+}
+
+// Validate checks if the token info is valid per the spec
 func (ti *TokenInfo) Validate() error {
-	// Validate name
-	if len(ti.Name) == 0 || len(ti.Name) > 64 {
-		return fmt.Errorf("token name must be 1-64 characters, got %d", len(ti.Name))
+	// Validate ticker (3-32 chars, [A-Za-z0-9] only)
+	if len(ti.Ticker) < 3 || len(ti.Ticker) > 32 {
+		return fmt.Errorf("ticker must be 3-32 characters, got %d", len(ti.Ticker))
 	}
 
-	if !isASCII(ti.Name) {
-		return fmt.Errorf("token name must be ASCII only")
-	}
-
-	// Validate ticker
-	if len(ti.Ticker) == 0 || len(ti.Ticker) > 16 {
-		return fmt.Errorf("token ticker must be 1-16 characters, got %d", len(ti.Ticker))
-	}
-
-	if !isASCII(ti.Ticker) {
-		return fmt.Errorf("token ticker must be ASCII only")
-	}
-
-	// Validate ticker format (alphanumeric and underscores only)
-	tickerRegex := regexp.MustCompile(`^[A-Z0-9_]+$`)
+	tickerRegex := regexp.MustCompile(`^[A-Za-z0-9]+$`)
 	if !tickerRegex.MatchString(ti.Ticker) {
-		return fmt.Errorf("token ticker must contain only uppercase letters, numbers, and underscores")
+		return fmt.Errorf("ticker must contain only A-Z, a-z, 0-9")
 	}
 
-	// Validate economics
-	if ti.TotalSupply == 0 {
-		return fmt.Errorf("token total supply must be greater than zero")
+	// Validate desc (0-64 chars, [A-Za-z0-9] only)
+	if len(ti.Desc) > 64 {
+		return fmt.Errorf("desc must be 0-64 characters, got %d", len(ti.Desc))
 	}
 
-	if ti.Decimals > 18 {
-		return fmt.Errorf("token decimals cannot exceed 18")
+	if len(ti.Desc) > 0 {
+		descRegex := regexp.MustCompile(`^[A-Za-z0-9]+$`)
+		if !descRegex.MatchString(ti.Desc) {
+			return fmt.Errorf("desc must contain only A-Z, a-z, 0-9")
+		}
+	}
+
+	// Validate MAX_MINT (1 to 21 million base units)
+	if ti.MaxMint == 0 || ti.MaxMint > 21_000_000 {
+		return fmt.Errorf("max_mint must be 1 to 21,000,000, got %d", ti.MaxMint)
+	}
+
+	// Validate MAX_DECIMALS (0-8, cannot exceed SHADOW decimals)
+	if ti.MaxDecimals > 8 {
+		return fmt.Errorf("max_decimals cannot exceed 8 (SHADOW decimals), got %d", ti.MaxDecimals)
+	}
+
+	// Validate MINT_VERSION (currently must be 0)
+	if ti.MintVersion != 0 {
+		return fmt.Errorf("mint_version must be 0, got %d", ti.MintVersion)
+	}
+
+	// Validate TotalSupply matches MaxMint * 10^MaxDecimals
+	expectedSupply := ti.MaxMint
+	for i := uint8(0); i < ti.MaxDecimals; i++ {
+		expectedSupply *= 10
+	}
+	if ti.TotalSupply != expectedSupply {
+		return fmt.Errorf("total_supply (%d) doesn't match max_mint * 10^max_decimals (%d)",
+			ti.TotalSupply, expectedSupply)
+	}
+
+	// For custom tokens, validate staking (LockedShadow must equal TotalSupply)
+	if !ti.IsBaseToken() && ti.LockedShadow != ti.TotalSupply {
+		return fmt.Errorf("locked_shadow (%d) must equal total_supply (%d) for custom tokens",
+			ti.LockedShadow, ti.TotalSupply)
 	}
 
 	// Validate creation time
 	if ti.CreationTime <= 0 {
-		return fmt.Errorf("token creation time must be positive")
+		return fmt.Errorf("creation_time must be positive")
 	}
 
-	// Validate that calculated token ID matches stored ID (if present)
-	if ti.TokenID != "" {
-		calculatedID, err := ti.CalculateTokenID()
-		if err != nil {
-			return fmt.Errorf("failed to calculate token ID for validation: %w", err)
-		}
-
-		if ti.TokenID != calculatedID {
-			return fmt.Errorf("token ID mismatch: stored %s, calculated %s", ti.TokenID, calculatedID)
-		}
+	// Validate token ID is not empty
+	if ti.TokenID == "" {
+		return fmt.Errorf("token_id cannot be empty")
 	}
 
 	return nil
 }
 
-// SetTokenID calculates and sets the token ID
-func (ti *TokenInfo) SetTokenID() error {
-	tokenID, err := ti.CalculateTokenID()
-	if err != nil {
-		return err
-	}
-
-	ti.TokenID = tokenID
-	return nil
+// SetTokenID sets the token ID (should be TX ID of minting transaction)
+func (ti *TokenInfo) SetTokenID(txID string) {
+	ti.TokenID = txID
 }
 
 // IsBaseToken returns true if this is the base SHADOW token
@@ -164,69 +161,75 @@ func (ti *TokenInfo) IsBaseToken() bool {
 
 // FormatSupply formats the total supply with proper decimal places
 func (ti *TokenInfo) FormatSupply() string {
-	if ti.Decimals == 0 {
+	if ti.MaxDecimals == 0 {
 		return fmt.Sprintf("%d %s", ti.TotalSupply, ti.Ticker)
 	}
 
 	divisor := uint64(1)
-	for i := uint8(0); i < ti.Decimals; i++ {
+	for i := uint8(0); i < ti.MaxDecimals; i++ {
 		divisor *= 10
 	}
 
 	whole := ti.TotalSupply / divisor
 	fractional := ti.TotalSupply % divisor
 
-	formatStr := fmt.Sprintf("%%d.%%0%dd %%s", ti.Decimals)
+	formatStr := fmt.Sprintf("%%d.%%0%dd %%s", ti.MaxDecimals)
 	return fmt.Sprintf(formatStr, whole, fractional, ti.Ticker)
 }
 
-// CalculateStakingRequirement calculates required base token staking for minting
-func (ti *TokenInfo) CalculateStakingRequirement(mintAmount uint64) uint64 {
+// CalculateStakingRequirement calculates required SHADOW staking for minting (1:1 with total supply)
+func (ti *TokenInfo) CalculateStakingRequirement() uint64 {
 	if ti.IsBaseToken() {
 		return 0 // Base token doesn't require staking
 	}
 
-	// Staking requirement is proportional to melt value
-	// If melt value per token is 0, require 1 satoshi per token unit to prevent dust
-	if ti.MeltValuePerToken == 0 {
-		return mintAmount
-	}
-
-	return mintAmount * ti.MeltValuePerToken
+	// 1:1 staking: total_supply satoshis of SHADOW required
+	return ti.TotalSupply
 }
 
-// CalculateMeltValue calculates base currency returned when melting tokens
+// CalculateMeltValue calculates SHADOW returned when melting tokens (proportional to locked amount)
 func (ti *TokenInfo) CalculateMeltValue(tokenAmount uint64) uint64 {
 	if ti.IsBaseToken() {
-		return tokenAmount // Base token melts to itself
+		return 0 // Cannot melt SHADOW
 	}
 
-	return tokenAmount * ti.MeltValuePerToken
+	if ti.TotalSupply == 0 {
+		return 0
+	}
+
+	// Return proportional SHADOW: (melted_amount / total_supply) * locked_shadow
+	return (tokenAmount * ti.LockedShadow) / ti.TotalSupply
 }
 
-// CreateCustomToken creates a new custom token
-func CreateCustomToken(name, ticker string, totalSupply uint64, decimals uint8,
-	meltValuePerToken uint64, creatorAddress Address) (*TokenInfo, error) {
-
-	tokenInfo := &TokenInfo{
-		Name:              name,
-		Ticker:            ticker,
-		TotalSupply:       totalSupply,
-		Decimals:          decimals,
-		MeltValuePerToken: meltValuePerToken,
-		CreatorAddress:    creatorAddress,
-		CreationTime:      time.Now().Unix(),
+// CreateCustomToken creates a new custom token (token ID will be set when minting TX is created)
+func CreateCustomToken(ticker, desc string, maxMint uint64, maxDecimals uint8, creatorAddress Address) (*TokenInfo, error) {
+	// Calculate total supply
+	totalSupply := maxMint
+	for i := uint8(0); i < maxDecimals; i++ {
+		totalSupply *= 10
 	}
 
-	// Validate the token info
+	tokenInfo := &TokenInfo{
+		TokenID:        "", // Will be set to TX ID when minted
+		Ticker:         ticker,
+		Desc:           desc,
+		MaxMint:        maxMint,
+		MaxDecimals:    maxDecimals,
+		TotalSupply:    totalSupply,
+		LockedShadow:   totalSupply, // 1:1 staking
+		TotalMelted:    0,
+		MintVersion:    0,
+		CreatorAddress: creatorAddress,
+		CreationTime:   time.Now().Unix(),
+	}
+
+	// Validate the token info (except TokenID which will be set later)
+	// Temporarily set a dummy TokenID for validation
+	tokenInfo.TokenID = "pending"
 	if err := tokenInfo.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid token info: %w", err)
 	}
-
-	// Calculate and set token ID
-	if err := tokenInfo.SetTokenID(); err != nil {
-		return nil, fmt.Errorf("failed to set token ID: %w", err)
-	}
+	tokenInfo.TokenID = "" // Clear it
 
 	return tokenInfo, nil
 }
@@ -258,7 +261,37 @@ func (tr *TokenRegistry) RegisterToken(tokenInfo *TokenInfo) error {
 		return fmt.Errorf("token %s already registered", tokenInfo.TokenID)
 	}
 
+	// Check ticker availability (must be unique unless previous token fully melted)
+	if err := tr.CheckTickerAvailable(tokenInfo.Ticker); err != nil {
+		return err
+	}
+
 	tr.Tokens[tokenInfo.TokenID] = tokenInfo
+	return nil
+}
+
+// CheckTickerAvailable returns error if ticker is in use by an active token
+func (tr *TokenRegistry) CheckTickerAvailable(ticker string) error {
+	for _, token := range tr.Tokens {
+		if token.Ticker == ticker && !token.IsFullyMelted() {
+			return fmt.Errorf("ticker %s already in use by token %s", ticker, token.TokenID)
+		}
+	}
+	return nil
+}
+
+// RecordMelt updates the total melted amount for a token
+func (tr *TokenRegistry) RecordMelt(tokenID string, amount uint64) error {
+	token, exists := tr.Tokens[tokenID]
+	if !exists {
+		return fmt.Errorf("token %s not found", tokenID)
+	}
+
+	token.TotalMelted += amount
+	if token.TotalMelted > token.TotalSupply {
+		return fmt.Errorf("total melted (%d) exceeds total supply (%d)", token.TotalMelted, token.TotalSupply)
+	}
+
 	return nil
 }
 

@@ -29,7 +29,7 @@ func StartNode(config *CLIConfig) error {
 	}
 
 	// Create the P2P blockchain node
-	node, err := NewP2PBlockchainNode(p2pPort, apiPort)
+	node, err := NewP2PBlockchainNode(p2pPort, apiPort, config)
 	if err != nil {
 		return fmt.Errorf("failed to create blockchain node: %w", err)
 	}

@@ -456,6 +456,9 @@ func (ce *ConsensusEngine) commitBlock(block *Block) {
 		return
 	}
 
+	// Update mempool with new block height for expiration tracking
+	ce.mempool.UpdateBlockHeight(block.Index)
+
 	// Remove transactions from mempool
 	for _, txID := range block.Transactions {
 		ce.mempool.RemoveTransaction(txID)
@@ -491,6 +494,9 @@ func (ce *ConsensusEngine) handleBlockCommit(block *Block) {
 		fmt.Printf("[Consensus] Failed to add committed block: %v\n", err)
 		return
 	}
+
+	// Update mempool with new block height for expiration tracking
+	ce.mempool.UpdateBlockHeight(block.Index)
 
 	// Remove transactions from mempool
 	for _, txID := range block.Transactions {
