@@ -592,25 +592,271 @@ curl http://localhost:8080/api/admin/shutdown
 
 ## Token Information
 
-### Get Token Registry
-Returns information about registered tokens.
+### List All Tokens
+Returns information about all registered tokens in the token registry.
 
 **Endpoint:** `GET /api/tokens`
 
 **Response:**
 ```json
 {
-  "count": 1,
-  "genesis_token": {
-    "token_id": "SHADOW",
-    "name": "Shadow Token",
-    "symbol": "SHADOW",
-    "decimals": 8,
-    "total_supply": "21000000.00000000",
-    "description": "The native token of the Shadowy post-quantum blockchain"
-  }
+  "count": 2,
+  "tokens": [
+    {
+      "token_id": "ee5ccf1bab2fa5ce60bbaec533faf8332a637045b5c6d47803dce25e1591b626",
+      "ticker": "SHADOW",
+      "description": "Base token for Shadow Network",
+      "max_mint": 21000000,
+      "max_decimals": 8,
+      "total_supply": 2100000000000000,
+      "locked_shadow": 0,
+      "total_melted": 0,
+      "creator": "S00000000000000000000000000000000000000000000000000000000000000000",
+      "is_shadow": true,
+      "fully_melted": false
+    },
+    {
+      "token_id": "f6e5d4c3b2a1a9b8c7d6e5f4a3b2c1d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6",
+      "ticker": "MYTOKEN",
+      "description": "My custom token",
+      "max_mint": 1000000,
+      "max_decimals": 6,
+      "total_supply": 1000000000000,
+      "locked_shadow": 1000000000000,
+      "total_melted": 0,
+      "creator": "SA8b033b8fDe716eE1234567890aBcdEF12345678901234567890aBcdEf123456a",
+      "is_shadow": false,
+      "fully_melted": false
+    }
+  ]
 }
 ```
+
+**Response Fields:**
+- `count`: Number of registered tokens
+- `tokens`: Array of token objects
+  - `token_id`: Unique token identifier (hash of minting transaction)
+  - `ticker`: 3-32 character ticker symbol (A-Z, a-z, 0-9 only)
+  - `description`: Optional 0-64 character description
+  - `max_mint`: Maximum base units (before decimals), max 21 million
+  - `max_decimals`: Number of decimal places (0-8)
+  - `total_supply`: Total token supply in smallest unit (max_mint × 10^max_decimals)
+  - `locked_shadow`: SHADOW satoshis locked (1:1 with total_supply for custom tokens)
+  - `total_melted`: Total tokens that have been melted/burned
+  - `creator`: Address that created this token
+  - `is_shadow`: Whether this is the base SHADOW token
+  - `fully_melted`: Whether all tokens have been melted
+
+### Get Token Info
+Returns detailed information about a specific token.
+
+**Endpoint:** `GET /api/token/info`
+
+**Query Parameters:**
+- `token_id` (required): The token identifier hash
+
+**Example:**
+```bash
+curl "http://localhost:8080/api/token/info?token_id=f6e5d4c3b2a1a9b8c7d6e5f4a3b2c1d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6"
+```
+
+**Response:**
+```json
+{
+  "token_id": "f6e5d4c3b2a1a9b8c7d6e5f4a3b2c1d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6",
+  "ticker": "MYTOKEN",
+  "description": "My custom token",
+  "max_mint": 1000000,
+  "max_decimals": 6,
+  "total_supply": 1000000000000,
+  "locked_shadow": 1000000000000,
+  "total_melted": 0,
+  "creator": "SA8b033b8fDe716eE1234567890aBcdEF12345678901234567890aBcdEf123456a",
+  "creation_time": 1727632800,
+  "is_shadow": false,
+  "fully_melted": false,
+  "supply_formatted": "1000000.000000 MYTOKEN"
+}
+```
+
+**Error Response:**
+```json
+{
+  "error": "token not found"
+}
+```
+
+### Mint Token
+Creates a new custom token by locking SHADOW as collateral.
+
+**Endpoint:** `POST /api/token/mint`
+
+**Request Body:**
+```json
+{
+  "ticker": "MYTOKEN",
+  "description": "My custom token",
+  "max_mint": 1000000,
+  "max_decimals": 6
+}
+```
+
+**Parameters:**
+- `ticker` (required): 3-32 character ticker symbol (A-Z, a-z, 0-9 only)
+- `description` (optional): 0-64 character description (A-Z, a-z, 0-9 only)
+- `max_mint` (required): Maximum base units (1 to 21,000,000)
+- `max_decimals` (required): Number of decimal places (0-8)
+
+**SHADOW Staking Requirement:**
+Minting requires locking SHADOW at a 1:1 ratio with the total token supply:
+- `locked_shadow = max_mint × 10^max_decimals`
+- Example: `max_mint=1000000, max_decimals=6` requires `1000000000000` SHADOW satoshis locked
+
+**Example:**
+```bash
+# Mint 1 million tokens with 6 decimals (requires 1,000,000.000000 SHADOW locked)
+curl -X POST http://localhost:8080/api/token/mint \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ticker": "MYTOKEN",
+    "description": "My custom token",
+    "max_mint": 1000000,
+    "max_decimals": 6
+  }'
+```
+
+**Response:**
+```json
+{
+  "tx_id": "abc123def456...",
+  "token_id": "abc123def456...",
+  "ticker": "MYTOKEN",
+  "total_supply": 1000000000000,
+  "locked_shadow": 1000000000000,
+  "message": "Token minted successfully"
+}
+```
+
+**Response Fields:**
+- `tx_id`: Transaction ID of the minting transaction
+- `token_id`: Token identifier (same as tx_id)
+- `ticker`: Token ticker symbol
+- `total_supply`: Total token supply in smallest units
+- `locked_shadow`: Amount of SHADOW locked
+- `message`: Success message
+
+**Error Responses:**
+```json
+// Insufficient SHADOW
+{
+  "error": "insufficient SHADOW for staking: have 500000000000, need 1000000000000"
+}
+
+// Invalid ticker
+{
+  "error": "invalid token info: ticker must be 3-32 characters, got 2"
+}
+
+// Ticker already in use
+{
+  "error": "ticker MYTOKEN already in use by token abc123..."
+}
+```
+
+**Important Notes:**
+- The token_id is set to the transaction ID of the minting transaction
+- SHADOW is locked in the UTXO set and cannot be spent until tokens are melted
+- Ticker symbols must be unique across all active (non-fully-melted) tokens
+- Once a token is fully melted, its ticker can be reused
+
+### Melt Token
+Destroys custom tokens and unlocks the proportional SHADOW collateral.
+
+**Endpoint:** `POST /api/token/melt`
+
+**Request Body:**
+```json
+{
+  "token_id": "f6e5d4c3b2a1a9b8c7d6e5f4a3b2c1d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6",
+  "amount": 500000000000
+}
+```
+
+**Parameters:**
+- `token_id` (required): The token identifier hash
+- `amount` (required): Amount to melt in smallest units. Use `0` to melt all available tokens.
+
+**SHADOW Unlock Calculation:**
+Melting returns proportional SHADOW:
+- `unlocked_shadow = (melted_amount / total_supply) × locked_shadow`
+- Example: Melt 50% of tokens → unlock 50% of locked SHADOW
+
+**Examples:**
+```bash
+# Melt specific amount
+curl -X POST http://localhost:8080/api/token/melt \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token_id": "f6e5d4c3b2a1a9b8c7d6e5f4a3b2c1d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6",
+    "amount": 500000000000
+  }'
+
+# Melt all tokens
+curl -X POST http://localhost:8080/api/token/melt \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token_id": "f6e5d4c3b2a1a9b8c7d6e5f4a3b2c1d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6",
+    "amount": 0
+  }'
+```
+
+**Response:**
+```json
+{
+  "tx_id": "def789abc123...",
+  "token_id": "f6e5d4c3b2a1a9b8c7d6e5f4a3b2c1d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6",
+  "melted_amount": 500000000000,
+  "shadow_unlocked": 500000000000,
+  "message": "Token melted successfully"
+}
+```
+
+**Response Fields:**
+- `tx_id`: Transaction ID of the melting transaction
+- `token_id`: Token identifier
+- `melted_amount`: Amount of tokens destroyed
+- `shadow_unlocked`: Amount of SHADOW unlocked
+- `message`: Success message
+
+**Error Responses:**
+```json
+// No tokens to melt
+{
+  "error": "no token UTXOs found for address"
+}
+
+// Insufficient tokens
+{
+  "error": "insufficient token balance: have 100000000000, need 500000000000"
+}
+
+// Invalid token
+{
+  "error": "token not found"
+}
+
+// Cannot melt SHADOW
+{
+  "error": "cannot melt SHADOW base token"
+}
+```
+
+**Important Notes:**
+- You can only melt tokens you own
+- Melting is irreversible - tokens are permanently destroyed
+- SHADOW is unlocked proportionally to the amount melted
+- Use `amount: 0` to melt all available tokens in one transaction
+- When a token is fully melted (across all holders), its ticker can be reused
 
 ---
 

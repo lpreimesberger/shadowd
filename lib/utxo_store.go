@@ -90,9 +90,15 @@ func (store *UTXOStore) AddUTXO(utxo *UTXO) error {
 	}
 
 	// Add to address index
-	addrKey := fmt.Sprintf("%s%s:%s:%d", AddressPrefix, utxo.Output.Address.String(), utxo.TxID, utxo.OutputIndex)
+	addrStr := utxo.Output.Address.String()
+	addrKey := fmt.Sprintf("%s%s:%s:%d", AddressPrefix, addrStr, utxo.TxID, utxo.OutputIndex)
 	if err := store.db.Set([]byte(addrKey), []byte("")); err != nil {
 		return fmt.Errorf("failed to store address index: %w", err)
+	}
+
+	// Debug: verify address was stored correctly
+	if utxo.OutputIndex == 0 {
+		fmt.Printf("[UTXO] Indexed tx %s:0 for address %s (len=%d)\n", utxo.TxID[:16], addrStr[:16], len(addrStr))
 	}
 
 	// Add to height index
@@ -170,7 +176,10 @@ func (store *UTXOStore) GetUTXOsByAddress(address Address) ([]*UTXO, error) {
 	defer store.mutex.RUnlock()
 
 	var utxos []*UTXO
-	prefix := fmt.Sprintf("%s%s:", AddressPrefix, address.String())
+	addrStr := address.String()
+	prefix := fmt.Sprintf("%s%s:", AddressPrefix, addrStr)
+
+	fmt.Printf("[UTXO Query] Looking for UTXOs with prefix: %s (addr len=%d)\n", prefix[:40], len(addrStr))
 
 	// Iterate through address index
 	iterator, err := store.db.Iterator([]byte(prefix), nil)
@@ -179,7 +188,9 @@ func (store *UTXOStore) GetUTXOsByAddress(address Address) ([]*UTXO, error) {
 	}
 	defer iterator.Close()
 
+	matchCount := 0
 	for ; iterator.Valid(); iterator.Next() {
+		matchCount++
 		// Parse key to extract txID and outputIndex
 		key := string(iterator.Key())
 		var txID string
@@ -218,6 +229,7 @@ func (store *UTXOStore) GetUTXOsByAddress(address Address) ([]*UTXO, error) {
 		}
 	}
 
+	fmt.Printf("[UTXO Query] Found %d matching keys, returning %d unspent UTXOs\n", matchCount, len(utxos))
 	return utxos, nil
 }
 
@@ -343,12 +355,25 @@ func (store *UTXOStore) ProcessTokenTransaction(tx *Transaction, tokenRegistry *
 		// Set token ID to this TX ID
 		tokenInfo.SetTokenID(txID)
 
+		// Update the token output to have the correct token ID
+		// The output was created with "PENDING" placeholder, now set it to actual TX ID
+		for i, output := range tx.Outputs {
+			if output.TokenType == "custom" && output.TokenID == "PENDING" {
+				tx.Outputs[i].TokenID = txID
+				break
+			}
+		}
+
 		// Register the token
 		if err := tokenRegistry.RegisterToken(tokenInfo); err != nil {
 			return fmt.Errorf("failed to register token: %w", err)
 		}
 
+		fmt.Printf("[TokenRegistry] ✅ Registered token: %s (ID: %s, Supply: %d)\n",
+			mintData.Ticker, txID[:16], tokenInfo.TotalSupply)
+
 	case TxTypeMelt:
+		fmt.Printf("[TokenRegistry] Processing melt transaction: %s\n", txID[:16])
 		// Find the token being melted and update total melted
 		for _, output := range tx.Outputs {
 			// Find SHADOW output - this tells us how much was melted
@@ -363,7 +388,8 @@ func (store *UTXOStore) ProcessTokenTransaction(tx *Transaction, tokenRegistry *
 						meltedAmount := uint64(0)
 						for _, input := range tx.Inputs {
 							utxo, err := store.GetUTXO(input.PrevTxID, input.OutputIndex)
-							if err == nil && utxo != nil {
+							if err == nil && utxo != nil && utxo.Output.TokenID == tokenID {
+								// Only count inputs of the token being melted (not SHADOW fee inputs)
 								meltedAmount += utxo.Output.Amount
 							}
 						}
@@ -373,8 +399,14 @@ func (store *UTXOStore) ProcessTokenTransaction(tx *Transaction, tokenRegistry *
 								meltedAmount -= out.Amount
 							}
 						}
-						// Record the melt
-						tokenRegistry.RecordMelt(tokenID, meltedAmount)
+						// Record the melt - MUST succeed or transaction is invalid
+						if err := tokenRegistry.RecordMelt(tokenID, meltedAmount); err != nil {
+							fmt.Printf("[TokenRegistry] ❌ Failed to record melt: %v\n", err)
+							return fmt.Errorf("melt transaction invalid: %w", err)
+						}
+						fmt.Printf("[TokenRegistry] ✅ Melted %d tokens (ID: %s)\n", meltedAmount, tokenID[:16])
+					} else {
+						fmt.Printf("[TokenRegistry] ⚠️  Could not find input UTXO for melt tx\n")
 					}
 				}
 				break

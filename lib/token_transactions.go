@@ -83,26 +83,16 @@ func CreateTokenMintTransaction(
 
 	builder.SetData(mintDataBytes)
 
-	// Build transaction to get TX ID (token ID will be this TX's ID)
-	tx := builder.Build()
-
-	// Get transaction ID
-	txID, err := tx.ID()
-	if err != nil {
-		return nil, fmt.Errorf("failed to calculate TX ID: %w", err)
-	}
-
-	// NOW we can add the token output (with the correct token ID = this TX ID)
+	// Add token output with temporary token ID (will be updated after signing)
+	// For now, use a placeholder - the actual token ID is set during ABCI processing
 	tokenOutput := &TxOutput{
 		Amount:       totalSupply,
 		Address:      creator,
-		TokenID:      txID, // Token ID is the TX ID of this minting transaction
+		TokenID:      "PENDING", // Placeholder - actual token ID = TX ID after signing
 		TokenType:    "custom",
 		LockedShadow: totalSupply, // 1:1 SHADOW locked
 		ScriptPubKey: CreateP2PKHScript(creator),
 	}
-
-	// Rebuild with token output
 	builder.AddCustomOutput(tokenOutput)
 
 	// Add SHADOW change output if any

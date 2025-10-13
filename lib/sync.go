@@ -232,7 +232,7 @@ func (c *BlockSyncClient) SyncFromPeer(peerID peer.ID) error {
 				continue
 			}
 
-			if err := c.chain.AddBlock(block); err != nil {
+			if err := c.chain.AddBlock(block, nil); err != nil {
 				return fmt.Errorf("failed to add block %d: %w", block.Index, err)
 			}
 			fmt.Printf("[Sync] Added block %d (hash: %s)\n", block.Index, block.Hash[:16])

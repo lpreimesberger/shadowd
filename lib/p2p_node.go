@@ -270,69 +270,123 @@ func (n *P2PBlockchainNode) handleSendTransaction(w http.ResponseWriter, r *http
 		return
 	}
 
+	// Check if sending custom token (not SHADOW)
+	genesisTokenID := GetGenesisToken().TokenID
+	isCustomToken := tokenID != genesisTokenID
+
 	// Filter for unspent UTXOs of the requested token
-	var availableUTXOs []*UTXO
+	var availableTokenUTXOs []*UTXO
+	var availableShadowUTXOs []*UTXO
 	for _, utxo := range utxos {
-		if !utxo.IsSpent && utxo.Output.TokenID == tokenID {
-			availableUTXOs = append(availableUTXOs, utxo)
-		}
-	}
-
-	// Determine the fee to use
-	// If custom fee provided, use it. Otherwise estimate based on inputs
-	var targetFee uint64
-	if req.Fee > 0 {
-		targetFee = req.Fee
-	} else {
-		targetFee = 1000 // Default from API spec
-	}
-
-	// Select UTXOs to cover the amount + fee
-	var selectedUTXOs []*UTXO
-	var total uint64
-	for _, utxo := range availableUTXOs {
-		selectedUTXOs = append(selectedUTXOs, utxo)
-		total += utxo.Output.Amount
-		// If no custom fee, recalculate based on inputs selected
-		if req.Fee == 0 {
-			targetFee = uint64(len(selectedUTXOs)) * 1150
-			if targetFee < 11500 {
-				targetFee = 11500
+		if !utxo.IsSpent {
+			if utxo.Output.TokenID == tokenID {
+				availableTokenUTXOs = append(availableTokenUTXOs, utxo)
+			} else if utxo.Output.TokenID == genesisTokenID {
+				availableShadowUTXOs = append(availableShadowUTXOs, utxo)
 			}
 		}
-		if total >= req.Amount+targetFee {
+	}
+
+	// Select token UTXOs to cover the amount
+	var selectedTokenUTXOs []*UTXO
+	var tokenTotal uint64
+	for _, utxo := range availableTokenUTXOs {
+		selectedTokenUTXOs = append(selectedTokenUTXOs, utxo)
+		tokenTotal += utxo.Output.Amount
+		if tokenTotal >= req.Amount {
 			break
 		}
 	}
 
-	// Final check with actual fee
-	if req.Fee == 0 {
-		targetFee = uint64(len(selectedUTXOs)) * 1150
-		if targetFee < 11500 {
-			targetFee = 11500
-		}
-	}
-	if total < req.Amount+targetFee {
-		http.Error(w, fmt.Sprintf("Insufficient balance: have %d, need %d (including %d fee)", total, req.Amount+targetFee, targetFee), http.StatusBadRequest)
+	if tokenTotal < req.Amount {
+		http.Error(w, fmt.Sprintf("Insufficient %s balance: have %d, need %d", tokenID[:16], tokenTotal, req.Amount), http.StatusBadRequest)
 		return
+	}
+
+	// For custom tokens, also need SHADOW for fee
+	var selectedShadowUTXOs []*UTXO
+	var shadowTotal uint64
+	var targetFee uint64
+
+	if isCustomToken {
+		// Estimate fee based on token inputs + shadow inputs needed
+		if req.Fee > 0 {
+			targetFee = req.Fee
+		} else {
+			// Estimate: token inputs + ~2 shadow inputs + outputs
+			targetFee = uint64(len(selectedTokenUTXOs)+2) * 1150
+			if targetFee < 11500 {
+				targetFee = 11500
+			}
+		}
+
+		// Select SHADOW UTXOs for fee
+		for _, utxo := range availableShadowUTXOs {
+			selectedShadowUTXOs = append(selectedShadowUTXOs, utxo)
+			shadowTotal += utxo.Output.Amount
+			if shadowTotal >= targetFee {
+				break
+			}
+		}
+
+		if shadowTotal < targetFee {
+			http.Error(w, fmt.Sprintf("Insufficient SHADOW for fee: have %d, need %d", shadowTotal, targetFee), http.StatusBadRequest)
+			return
+		}
+	} else {
+		// Sending SHADOW: fee comes from the same UTXOs
+		if req.Fee > 0 {
+			targetFee = req.Fee
+		} else {
+			targetFee = uint64(len(selectedTokenUTXOs)) * 1150
+			if targetFee < 11500 {
+				targetFee = 11500
+			}
+		}
+
+		if tokenTotal < req.Amount+targetFee {
+			http.Error(w, fmt.Sprintf("Insufficient balance: have %d, need %d (including %d fee)", tokenTotal, req.Amount+targetFee, targetFee), http.StatusBadRequest)
+			return
+		}
 	}
 
 	// Create transaction manually to support memo
 	txBuilder := NewTxBuilder(TxTypeSend)
 	txBuilder.SetTimestamp(time.Now().Unix())
 
-	// Add inputs
-	for _, utxo := range selectedUTXOs {
+	// Add token inputs
+	for _, utxo := range selectedTokenUTXOs {
 		txBuilder.AddInput(utxo.TxID, utxo.OutputIndex)
 	}
 
-	// Add output to recipient
+	// For custom tokens, also add SHADOW inputs for fee
+	if isCustomToken {
+		for _, utxo := range selectedShadowUTXOs {
+			txBuilder.AddInput(utxo.TxID, utxo.OutputIndex)
+		}
+	}
+
+	// Add output to recipient (token)
 	txBuilder.AddOutput(toAddr, req.Amount, tokenID)
 
-	// Add change output if needed
-	change := total - req.Amount - targetFee
-	if change > 0 {
-		txBuilder.AddOutput(n.Wallet.Address, change, tokenID)
+	// Add change outputs
+	if isCustomToken {
+		// Custom token: change is separate for token and SHADOW
+		tokenChange := tokenTotal - req.Amount
+		if tokenChange > 0 {
+			txBuilder.AddOutput(n.Wallet.Address, tokenChange, tokenID)
+		}
+
+		shadowChange := shadowTotal - targetFee
+		if shadowChange > 0 {
+			txBuilder.AddOutput(n.Wallet.Address, shadowChange, genesisTokenID)
+		}
+	} else {
+		// SHADOW: fee is deducted from same UTXOs
+		change := tokenTotal - req.Amount - targetFee
+		if change > 0 {
+			txBuilder.AddOutput(n.Wallet.Address, change, tokenID)
+		}
 	}
 
 	tx := txBuilder.Build()
@@ -489,18 +543,22 @@ func (n *P2PBlockchainNode) handleGetBalance(w http.ResponseWriter, r *http.Requ
 
 	// Convert balance map to array with token details
 	balances := []map[string]interface{}{}
+	tokenRegistry := GetGlobalTokenRegistry()
+
+	fmt.Printf("[Balance] Token registry has %d tokens registered\n", tokenRegistry.GetTokenCount())
+
 	for tokenID, balance := range balanceMap {
 		tokenInfo := map[string]interface{}{
 			"token_id": tokenID,
 			"balance":  balance,
 		}
 
-		// Add token metadata (for now, only support SHADOW genesis token)
-		if tokenID == GetGenesisToken().TokenID || tokenID == "SHADOW" {
-			genesis := GetGenesisToken()
-			tokenInfo["name"] = genesis.Ticker // Use ticker as name
-			tokenInfo["ticker"] = genesis.Ticker
-			tokenInfo["decimals"] = genesis.MaxDecimals
+		// Look up token metadata from registry
+		token, exists := tokenRegistry.GetToken(tokenID)
+		if exists {
+			tokenInfo["name"] = token.Ticker // Use ticker as name
+			tokenInfo["ticker"] = token.Ticker
+			tokenInfo["decimals"] = token.MaxDecimals
 		} else {
 			// For unknown tokens, provide defaults
 			tokenInfo["name"] = "Unknown Token"
@@ -662,6 +720,10 @@ func (n *P2PBlockchainNode) handleGetTokens(w http.ResponseWriter, r *http.Reque
 
 	tokenList := make([]map[string]interface{}, 0)
 	for _, token := range tokens {
+		// Skip fully melted tokens from the list (dead tokens that allowed ticker reuse)
+		if token.IsFullyMelted() {
+			continue
+		}
 		tokenList = append(tokenList, map[string]interface{}{
 			"token_id":     token.TokenID,
 			"ticker":       token.Ticker,

@@ -89,6 +89,12 @@ func NewBlockchain(storePath string) (*Blockchain, error) {
 		}
 		fmt.Printf("[Chain] Loaded %d blocks from storage, latest hash: %s\n",
 			len(bc.blocks), bc.blocks[len(bc.blocks)-1].Hash[:16])
+
+		// Rebuild token registry from blockchain
+		fmt.Printf("[Chain] Rebuilding token registry from blockchain...\n")
+		if err := bc.rebuildTokenRegistry(); err != nil {
+			fmt.Printf("[Chain] Warning: Failed to rebuild token registry: %v\n", err)
+		}
 	} else {
 		// Create new genesis block
 		genesis := &Block{
@@ -202,7 +208,7 @@ func (bc *Blockchain) ValidateBlock(block *Block) error {
 }
 
 // AddBlock adds a validated block to the chain
-func (bc *Blockchain) AddBlock(block *Block) error {
+func (bc *Blockchain) AddBlock(block *Block, mempool *Mempool) error {
 	// Validate first
 	if err := bc.ValidateBlock(block); err != nil {
 		return fmt.Errorf("block validation failed: %w", err)
@@ -234,6 +240,58 @@ func (bc *Blockchain) AddBlock(block *Block) error {
 		fmt.Printf("[Chain] Processed coinbase tx for block %d: %s\n", block.Index, coinbaseID[:16])
 	}
 
+	// Process regular transactions from mempool
+	tokenRegistry := GetGlobalTokenRegistry()
+	for _, txID := range block.Transactions {
+		// Get transaction from mempool first, then try storage
+		var tx *Transaction
+		if mempool != nil {
+			tx, _ = mempool.GetTransaction(txID)
+		}
+		if tx == nil {
+			// Try storage as fallback (for syncing old blocks)
+			tx, _ = bc.utxoStore.GetTransaction(txID)
+		}
+		if tx == nil {
+			fmt.Printf("[Chain] Warning: Transaction %s not found in mempool or storage, skipping\n", txID[:16])
+			continue
+		}
+
+		// Store transaction at this block height
+		if err := bc.utxoStore.StoreTransaction(tx, int64(block.Index)); err != nil {
+			fmt.Printf("[Chain] Warning: Failed to store transaction %s: %v\n", txID[:16], err)
+			continue
+		}
+
+		// Handle token-specific operations FIRST (updates tx.Outputs[].TokenID from PENDING to actual)
+		if err := bc.utxoStore.ProcessTokenTransaction(tx, tokenRegistry); err != nil {
+			fmt.Printf("[Chain] Warning: Failed to process token transaction %s: %v\n", txID[:16], err)
+		}
+
+		// Spend inputs (mark UTXOs as spent)
+		for _, input := range tx.Inputs {
+			if err := bc.utxoStore.SpendUTXO(input.PrevTxID, input.OutputIndex); err != nil {
+				fmt.Printf("[Chain] Warning: Failed to spend UTXO %s:%d: %v\n", input.PrevTxID[:16], input.OutputIndex, err)
+			}
+		}
+
+		// Create new UTXOs from outputs (after ProcessTokenTransaction fixed the TokenID)
+		for i, output := range tx.Outputs {
+			utxo := &UTXO{
+				TxID:        txID,
+				OutputIndex: uint32(i),
+				Output:      output,
+				BlockHeight: block.Index,
+				IsSpent:     false,
+			}
+			if err := bc.utxoStore.AddUTXO(utxo); err != nil {
+				fmt.Printf("[Chain] Warning: Failed to add UTXO: %v\n", err)
+			}
+		}
+
+		fmt.Printf("[Chain] Applied transaction %s (type: %s)\n", txID[:16], tx.TxType.String())
+	}
+
 	// Persist to storage
 	if err := bc.store.SaveBlock(block); err != nil {
 		return fmt.Errorf("failed to persist block: %w", err)
@@ -242,6 +300,67 @@ func (bc *Blockchain) AddBlock(block *Block) error {
 	bc.blocks = append(bc.blocks, block)
 	fmt.Printf("[Chain] Added block %d to chain, height now: %d\n", block.Index, len(bc.blocks))
 
+	return nil
+}
+
+// rebuildTokenRegistry scans all blocks and rebuilds the token registry from mint transactions
+func (bc *Blockchain) rebuildTokenRegistry() error {
+	tokenRegistry := GetGlobalTokenRegistry()
+	tokenCount := 0
+
+	// Scan all blocks for mint transactions
+	for _, block := range bc.blocks {
+		// Process all transactions in the block
+		for _, txID := range block.Transactions {
+			tx, err := bc.utxoStore.GetTransaction(txID)
+			if err != nil || tx == nil {
+				continue
+			}
+
+			// Only process mint transactions
+			if tx.TxType == TxTypeMintToken {
+				// Extract token metadata
+				var mintData TokenMintData
+				if err := json.Unmarshal(tx.Data, &mintData); err != nil {
+					fmt.Printf("[Chain] Warning: Failed to parse mint data for tx %s: %v\n", txID[:16], err)
+					continue
+				}
+
+				// Get token creator from first output
+				if len(tx.Outputs) == 0 {
+					continue
+				}
+				creator := tx.Outputs[0].Address
+
+				// Create TokenInfo
+				tokenInfo, err := CreateCustomToken(
+					mintData.Ticker,
+					mintData.Desc,
+					mintData.MaxMint,
+					mintData.MaxDecimals,
+					creator,
+				)
+				if err != nil {
+					fmt.Printf("[Chain] Warning: Failed to create token info for %s: %v\n", mintData.Ticker, err)
+					continue
+				}
+
+				// Set token ID to transaction ID
+				tokenInfo.SetTokenID(txID)
+
+				// Register the token
+				if err := tokenRegistry.RegisterToken(tokenInfo); err != nil {
+					// Ignore duplicate registration errors (token already exists)
+					continue
+				}
+
+				tokenCount++
+				fmt.Printf("[Chain] Restored token: %s (ID: %s)\n", mintData.Ticker, txID[:16])
+			}
+		}
+	}
+
+	fmt.Printf("[Chain] Token registry rebuilt: %d custom tokens restored\n", tokenCount)
 	return nil
 }
 

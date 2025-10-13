@@ -234,6 +234,8 @@ func (ce *ConsensusEngine) proposeBlock() {
 	txIDs := []string{}
 	totalFees := uint64(0)
 
+	fmt.Printf("[Consensus] Mempool has %d transactions to include\n", len(txs))
+
 	// Calculate total fees from transactions
 	for _, tx := range txs {
 		txID, err := tx.ID()
@@ -432,11 +434,17 @@ func (ce *ConsensusEngine) handleBlockVote(vote *BlockVote) {
 
 	// Check if we have quorum (need majority + need at least 1 peer)
 	peerCount := len(ce.host.Network().Peers()) + 1 // +1 for ourselves
-	if peerCount < 2 {
-		peerCount = 2 // Minimum for testing
+
+	// Single-node network: auto-commit if we voted yes
+	if peerCount == 1 {
+		if yesVotes > 0 {
+			fmt.Printf("[Consensus] ✓ Block %d approved (single-node mode)! Committing...\n", ce.pendingProposal.Index)
+			ce.commitBlock(ce.pendingProposal)
+		}
+		return
 	}
 
-	// Require votes from a majority of nodes (more than half)
+	// Multi-node: require majority
 	requiredVotes := (peerCount / 2) + 1
 	threshold := float64(yesVotes) / float64(totalVotes)
 	fmt.Printf("[Consensus] Quorum check: totalVotes=%d >= requiredVotes=%d ? %v, threshold=%.2f > 0.5 ? %v\n",
@@ -451,7 +459,7 @@ func (ce *ConsensusEngine) handleBlockVote(vote *BlockVote) {
 // commitBlock adds the block to the chain and broadcasts commit
 func (ce *ConsensusEngine) commitBlock(block *Block) {
 	// Add to chain
-	if err := ce.chain.AddBlock(block); err != nil {
+	if err := ce.chain.AddBlock(block, ce.mempool); err != nil {
 		fmt.Printf("[Consensus] Failed to add block: %v\n", err)
 		return
 	}
@@ -490,7 +498,7 @@ func (ce *ConsensusEngine) handleBlockCommit(block *Block) {
 	}
 
 	// Add to our chain
-	if err := ce.chain.AddBlock(block); err != nil {
+	if err := ce.chain.AddBlock(block, ce.mempool); err != nil {
 		fmt.Printf("[Consensus] Failed to add committed block: %v\n", err)
 		return
 	}

@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"bytes"
 	"fmt"
 
 	bolt "go.etcd.io/bbolt"
@@ -138,6 +139,13 @@ func (bi *BoltIterator) Valid() bool {
 	// Check if we've passed the end
 	if bi.end != nil && bi.key != nil && string(bi.key) >= string(bi.end) {
 		return false
+	}
+
+	// If no explicit end, check if key still has the start prefix (common pattern for prefix scans)
+	if bi.end == nil && bi.start != nil && bi.key != nil {
+		if !bytes.HasPrefix(bi.key, bi.start) {
+			return false
+		}
 	}
 
 	return bi.key != nil
