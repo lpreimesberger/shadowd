@@ -22,6 +22,7 @@ type CLIConfig struct {
 	APIPort               int      `mapstructure:"api_port" json:"api_port"`                                 // API/HTTP listen port
 	MempoolTxExpiryBlocks int      `mapstructure:"mempool_tx_expiry_blocks" json:"mempool_tx_expiry_blocks"` // Blocks before tx expires from mempool (default: 2048)
 	MempoolMaxSizeMB      int      `mapstructure:"mempool_max_size_mb" json:"mempool_max_size_mb"`           // Maximum mempool size in MB (default: 300)
+	APIKey                string   `mapstructure:"api_key" json:"api_key"`                                   // Optional API key for write endpoints (env: SHADOWY_API_KEY)
 }
 
 // SeedNode represents a parsed seed node
@@ -48,6 +49,10 @@ func ParseCLI() (*CLIConfig, error) {
 	viper.SetConfigType("json")
 	viper.AddConfigPath(".") // Look for config file in current directory
 
+	// Enable environment variable support
+	viper.SetEnvPrefix("SHADOWY")
+	viper.AutomaticEnv()
+
 	// Set defaults
 	viper.SetDefault("quiet", false)
 	viper.SetDefault("seeds", []string{})
@@ -58,6 +63,7 @@ func ParseCLI() (*CLIConfig, error) {
 	viper.SetDefault("api_port", 8080)
 	viper.SetDefault("mempool_tx_expiry_blocks", 2048)
 	viper.SetDefault("mempool_max_size_mb", 300)
+	viper.SetDefault("api_key", "") // No API key by default
 
 	// Define command line flags
 	quietFlag := flag.Bool("quiet", false, "Suppress verbose output (especially Tendermint debug info)")
@@ -67,6 +73,7 @@ func ParseCLI() (*CLIConfig, error) {
 	blockchainDirFlag := flag.String("blockchain-dir", "", "Directory for blockchain data (Tendermint files), defaults to ./blockchain")
 	p2pPortFlag := flag.Int("p2p-port", 9000, "P2P listen port (default: 9000)")
 	apiPortFlag := flag.Int("api-port", 8080, "API/HTTP listen port (default: 8080)")
+	apiKeyFlag := flag.String("api-key", "", "API key for write endpoints (or set SHADOWY_API_KEY env var)")
 
 	// Parse command line
 	flag.Parse()
@@ -119,6 +126,10 @@ func ParseCLI() (*CLIConfig, error) {
 
 	if *apiPortFlag != 8080 {
 		viper.Set("api_port", *apiPortFlag)
+	}
+
+	if *apiKeyFlag != "" {
+		viper.Set("api_key", *apiKeyFlag)
 	}
 
 	// Unmarshal config into struct

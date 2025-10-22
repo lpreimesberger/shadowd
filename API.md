@@ -860,6 +860,223 @@ curl -X POST http://localhost:8080/api/token/melt \
 
 ---
 
+## Atomic Swaps
+
+SHADOW supports trustless peer-to-peer token trading through atomic swap offers.
+
+**See [SWAPS.md](SWAPS.md) for complete documentation.**
+
+### Quick Reference
+
+**Create Offer:**
+```bash
+POST /api/swap/offer
+{
+  "have_token_id": "abc...",
+  "want_token_id": "def...",
+  "have_amount": 1000,
+  "want_amount": 5000,
+  "expires_at_block": 125000  // optional
+}
+```
+
+**Accept Offer:**
+```bash
+POST /api/swap/accept
+{
+  "offer_tx_id": "xyz..."
+}
+```
+
+**Cancel Offer:**
+```bash
+POST /api/swap/cancel
+{
+  "offer_tx_id": "xyz..."
+}
+```
+
+**List Active Offers:**
+```bash
+GET /api/swap/list
+```
+
+Returns all active offers (not accepted, not cancelled, not expired).
+
+---
+
+## Liquidity Pools
+
+SHADOW supports AMM-style constant product liquidity pools for decentralized token trading.
+
+### Create Pool
+
+Create a new liquidity pool for a token pair:
+
+```bash
+POST /api/pool/create
+Content-Type: application/json
+
+{
+  "token_a": "7abf97c6d93541347a766a339fde7fc175a77ef8953b33953f5c7dc022993132",
+  "token_b": "d1b55d0b5a4fcf20380f39c24d67710239b09d2718e5bd65a6a8f2f37952c692",
+  "amount_a": 1000000000,
+  "amount_b": 5000000,
+  "fee_percent": 30  // Optional: 30 = 0.3%, defaults to 30, range: 10-1000 (0.1%-10%)
+}
+```
+
+**Response:**
+```json
+{
+  "tx_id": "abc123...",
+  "status": "pool_creation_submitted",
+  "pool_id": "abc123..."
+}
+```
+
+**Notes:**
+- Pool ID is the transaction ID of the pool creation
+- LP tokens are minted using formula: `sqrt(amount_a × amount_b)`, then adjusted to match `max_mint × 10^8` validation
+- LP token ticker format: `{TOKEN_A}{TOKEN_B}LP` (alphanumeric only, e.g., "SHADOWBOOBSLP")
+- LP token description format: `{TOKEN_A}{TOKEN_B}LiquidityPool`
+- Locked tokens are held by the pool (no outputs created for them)
+- LP tokens are sent to pool creator
+- Only one pool per token pair allowed (checked at API level)
+
+### List Pools
+
+Get all active liquidity pools:
+
+```bash
+GET /api/pool/list
+```
+
+**Response:**
+```json
+{
+  "pools": [
+    {
+      "pool_id": "abc123...",
+      "token_a": "token_id_a",
+      "token_a_ticker": "SHADOW",
+      "token_b": "token_id_b",
+      "token_b_ticker": "BOOBS",
+      "reserve_a": 1000000000,
+      "reserve_b": 5000000,
+      "lp_token_id": "abc123...",
+      "lp_token_ticker": "SHADOW-BOOBS LP",
+      "lp_token_supply": 70710678,
+      "fee_percent": 30,
+      "k": 5000000000000000,
+      "rate_a_to_b": 200.0,
+      "rate_b_to_a": 0.005,
+      "created_at": 12345
+    }
+  ],
+  "count": 1
+}
+```
+
+**Pool Info Fields:**
+- `reserve_a`, `reserve_b`: Current token reserves in the pool
+- `k`: Constant product (reserve_a × reserve_b)
+- `rate_a_to_b`: Current exchange rate (how much A per 1 B)
+- `rate_b_to_a`: Current exchange rate (how much B per 1 A)
+- `fee_percent`: Trading fee in basis points (30 = 0.3%)
+
+### Add Liquidity
+
+Add liquidity to an existing pool:
+
+```bash
+POST /api/pool/add_liquidity
+Content-Type: application/json
+
+{
+  "pool_id": "abc123...",
+  "amount_a": 100000000,
+  "amount_b": 500000,
+  "min_lp_tokens": 7000000  // Slippage protection
+}
+```
+
+**Response:**
+```json
+{
+  "tx_id": "def456...",
+  "status": "add_liquidity_submitted"
+}
+```
+
+**Notes:**
+- Amounts must maintain the pool ratio (within 1% tolerance)
+- LP tokens minted = `min(amount_a/reserve_a, amount_b/reserve_b) × lp_supply`
+- Transaction fails if LP tokens received < `min_lp_tokens`
+- Locks token A and B, mints LP tokens to provider
+
+### Remove Liquidity
+
+Remove liquidity from a pool by burning LP tokens:
+
+```bash
+POST /api/pool/remove_liquidity
+Content-Type: application/json
+
+{
+  "pool_id": "abc123...",
+  "lp_tokens": 7000000,
+  "min_amount_a": 95000000,  // Slippage protection
+  "min_amount_b": 475000     // Slippage protection
+}
+```
+
+**Response:**
+```json
+{
+  "tx_id": "ghi789...",
+  "status": "remove_liquidity_submitted"
+}
+```
+
+**Notes:**
+- Returns proportional amounts: `(lp_tokens / lp_supply) × reserve`
+- Transaction fails if returned amounts < minimums
+- Burns LP tokens, returns token A and B to provider
+
+### Swap
+
+Swap tokens through a liquidity pool:
+
+```bash
+POST /api/pool/swap
+Content-Type: application/json
+
+{
+  "pool_id": "abc123...",
+  "token_in": "token_id_a",
+  "amount_in": 10000000,
+  "min_amount_out": 49000  // Slippage protection
+}
+```
+
+**Response:**
+```json
+{
+  "tx_id": "jkl012...",
+  "status": "swap_submitted"
+}
+```
+
+**Notes:**
+- Uses constant product AMM formula: `x × y = k`
+- Output calculation: `amountOut = (amountIn × (10000 - fee) × reserveOut) / ((reserveIn × 10000) + (amountIn × (10000 - fee)))`
+- Transaction fails if output < `min_amount_out`
+- Fee is taken from input token
+- Locks input token, returns output token
+
+---
+
 ## Transaction Types
 
 The blockchain supports several transaction types:
@@ -869,6 +1086,14 @@ The blockchain supports several transaction types:
 - `1` - **Send**: Transfer tokens between addresses
 - `2` - **Mint Token**: Create new custom tokens
 - `3` - **Melt**: Destroy/burn tokens
+- `4` - **Register Validator**: Register validator wallet address
+- `5` - **Offer**: Create atomic swap offer (locks tokens)
+- `6` - **Accept Offer**: Execute atomic swap
+- `7` - **Cancel Offer**: Cancel swap offer (reclaim tokens)
+- `8` - **Create Pool**: Create liquidity pool (locks tokens, mints LP tokens)
+- `9` - **Add Liquidity**: Add liquidity to pool (mints LP tokens)
+- `10` - **Remove Liquidity**: Remove liquidity from pool (burns LP tokens)
+- `11` - **Swap**: Swap tokens through liquidity pool
 
 ### Amount Format
 All amounts use 8 decimal places:

@@ -186,7 +186,7 @@ func ValidateTransaction(tx *Transaction) error {
 	}
 
 	// Validate transaction type
-	if tx.TxType < TxTypeCoinbase || tx.TxType > TxTypeRegisterValidator {
+	if tx.TxType < TxTypeCoinbase || tx.TxType > TxTypeSwap {
 		return fmt.Errorf("invalid transaction type: %d", int(tx.TxType))
 	}
 
@@ -202,6 +202,20 @@ func ValidateTransaction(tx *Transaction) error {
 		return validateMeltTransaction(tx)
 	case TxTypeRegisterValidator:
 		return validateRegisterValidatorTransaction(tx)
+	case TxTypeOffer:
+		return validateOfferTransaction(tx)
+	case TxTypeAcceptOffer:
+		return validateAcceptOfferTransaction(tx)
+	case TxTypeCancelOffer:
+		return validateCancelOfferTransaction(tx)
+	case TxTypeCreatePool:
+		return validateCreatePoolTransaction(tx)
+	case TxTypeAddLiquidity:
+		return validateAddLiquidityTransaction(tx)
+	case TxTypeRemoveLiquidity:
+		return validateRemoveLiquidityTransaction(tx)
+	case TxTypeSwap:
+		return validateSwapTransaction(tx)
 	default:
 		return fmt.Errorf("unsupported transaction type: %s", tx.TxType.String())
 	}
@@ -403,6 +417,26 @@ func (tx *Transaction) String() string {
 		id[:16]+"...", tx.TxType.String(), inputCount, outputCount)
 }
 
+// VerifyOwnership checks if the provided public key matches the transaction's signer
+func (tx *Transaction) VerifyOwnership(publicKeyBytes []byte) bool {
+	// Compare the provided public key with the transaction's public key
+	if len(tx.PublicKey) == 0 || len(publicKeyBytes) == 0 {
+		return false
+	}
+
+	if len(tx.PublicKey) != len(publicKeyBytes) {
+		return false
+	}
+
+	for i := range tx.PublicKey {
+		if tx.PublicKey[i] != publicKeyBytes[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
 // GetTotalInputAmount calculates total input amount (requires UTXO lookup)
 func (tx *Transaction) GetTotalInputAmount() uint64 {
 	// Note: In a real implementation, this would require looking up the actual UTXOs
@@ -465,4 +499,273 @@ func (tx *Transaction) GetTokenTypes() []string {
 		tokens = append(tokens, token)
 	}
 	return tokens
+}
+
+// validateOfferTransaction validates atomic swap offer transactions
+func validateOfferTransaction(tx *Transaction) error {
+	// Must have inputs (tokens being locked)
+	if len(tx.Inputs) == 0 {
+		return fmt.Errorf("offer transaction must have inputs")
+	}
+
+	// Must have Data field with offer metadata
+	if len(tx.Data) == 0 {
+		return fmt.Errorf("offer transaction must have offer metadata in Data field")
+	}
+
+	// Must be signed
+	if len(tx.Signature) == 0 {
+		return fmt.Errorf("offer transaction must be signed")
+	}
+
+	// Validate signature
+	if len(tx.PublicKey) > 0 {
+		publicKey, err := PublicKeyFromBytes(tx.PublicKey)
+		if err != nil {
+			return fmt.Errorf("invalid public key: %w", err)
+		}
+
+		hash, err := tx.Hash()
+		if err != nil {
+			return fmt.Errorf("failed to compute transaction hash: %w", err)
+		}
+
+		if !VerifySignature(hash, tx.Signature, publicKey) {
+			return fmt.Errorf("invalid transaction signature")
+		}
+	}
+
+	return nil
+}
+
+// validateAcceptOfferTransaction validates atomic swap accept transactions
+func validateAcceptOfferTransaction(tx *Transaction) error {
+	// Must have inputs (tokens being exchanged)
+	if len(tx.Inputs) == 0 {
+		return fmt.Errorf("accept offer transaction must have inputs")
+	}
+
+	// Must have outputs (tokens being distributed to both parties)
+	if len(tx.Outputs) == 0 {
+		return fmt.Errorf("accept offer transaction must have outputs")
+	}
+
+	// Must have Data field with reference to offer transaction
+	if len(tx.Data) == 0 {
+		return fmt.Errorf("accept offer transaction must have offer reference in Data field")
+	}
+
+	// Must be signed
+	if len(tx.Signature) == 0 {
+		return fmt.Errorf("accept offer transaction must be signed")
+	}
+
+	// Validate signature
+	if len(tx.PublicKey) > 0 {
+		publicKey, err := PublicKeyFromBytes(tx.PublicKey)
+		if err != nil {
+			return fmt.Errorf("invalid public key: %w", err)
+		}
+
+		hash, err := tx.Hash()
+		if err != nil {
+			return fmt.Errorf("failed to compute transaction hash: %w", err)
+		}
+
+		if !VerifySignature(hash, tx.Signature, publicKey) {
+			return fmt.Errorf("invalid transaction signature")
+		}
+	}
+
+	return nil
+}
+
+// validateCancelOfferTransaction validates atomic swap cancel transactions
+func validateCancelOfferTransaction(tx *Transaction) error {
+	// Must have inputs (for fee payment)
+	if len(tx.Inputs) == 0 {
+		return fmt.Errorf("cancel offer transaction must have inputs")
+	}
+
+	// Must have outputs (returning locked tokens)
+	if len(tx.Outputs) == 0 {
+		return fmt.Errorf("cancel offer transaction must have outputs")
+	}
+
+	// Must have Data field with reference to offer transaction
+	if len(tx.Data) == 0 {
+		return fmt.Errorf("cancel offer transaction must have offer reference in Data field")
+	}
+
+	// Must be signed
+	if len(tx.Signature) == 0 {
+		return fmt.Errorf("cancel offer transaction must be signed")
+	}
+
+	// Validate signature
+	if len(tx.PublicKey) > 0 {
+		publicKey, err := PublicKeyFromBytes(tx.PublicKey)
+		if err != nil {
+			return fmt.Errorf("invalid public key: %w", err)
+		}
+
+		hash, err := tx.Hash()
+		if err != nil {
+			return fmt.Errorf("failed to compute transaction hash: %w", err)
+		}
+
+		if !VerifySignature(hash, tx.Signature, publicKey) {
+			return fmt.Errorf("invalid transaction signature")
+		}
+	}
+
+	return nil
+}
+
+// validateCreatePoolTransaction validates pool creation transactions
+func validateCreatePoolTransaction(tx *Transaction) error {
+	// Must have inputs (tokens being locked)
+	if len(tx.Inputs) == 0 {
+		return fmt.Errorf("create pool transaction must have inputs")
+	}
+
+	// Must have Data field with pool metadata
+	if len(tx.Data) == 0 {
+		return fmt.Errorf("create pool transaction must have pool metadata in Data field")
+	}
+
+	// Must be signed
+	if len(tx.Signature) == 0 {
+		return fmt.Errorf("create pool transaction must be signed")
+	}
+
+	// Validate signature
+	if len(tx.PublicKey) > 0 {
+		publicKey, err := PublicKeyFromBytes(tx.PublicKey)
+		if err != nil {
+			return fmt.Errorf("invalid public key: %w", err)
+		}
+
+		hash, err := tx.Hash()
+		if err != nil {
+			return fmt.Errorf("failed to compute transaction hash: %w", err)
+		}
+
+		if !VerifySignature(hash, tx.Signature, publicKey) {
+			return fmt.Errorf("invalid transaction signature")
+		}
+	}
+
+	return nil
+}
+
+// validateAddLiquidityTransaction validates add liquidity transactions
+func validateAddLiquidityTransaction(tx *Transaction) error {
+	// Must have inputs (tokens being added)
+	if len(tx.Inputs) == 0 {
+		return fmt.Errorf("add liquidity transaction must have inputs")
+	}
+
+	// Must have Data field with pool reference and amounts
+	if len(tx.Data) == 0 {
+		return fmt.Errorf("add liquidity transaction must have pool data in Data field")
+	}
+
+	// Must be signed
+	if len(tx.Signature) == 0 {
+		return fmt.Errorf("add liquidity transaction must be signed")
+	}
+
+	// Validate signature
+	if len(tx.PublicKey) > 0 {
+		publicKey, err := PublicKeyFromBytes(tx.PublicKey)
+		if err != nil {
+			return fmt.Errorf("invalid public key: %w", err)
+		}
+
+		hash, err := tx.Hash()
+		if err != nil {
+			return fmt.Errorf("failed to compute transaction hash: %w", err)
+		}
+
+		if !VerifySignature(hash, tx.Signature, publicKey) {
+			return fmt.Errorf("invalid transaction signature")
+		}
+	}
+
+	return nil
+}
+
+// validateRemoveLiquidityTransaction validates remove liquidity transactions
+func validateRemoveLiquidityTransaction(tx *Transaction) error {
+	// Must have inputs (LP tokens being burned)
+	if len(tx.Inputs) == 0 {
+		return fmt.Errorf("remove liquidity transaction must have inputs")
+	}
+
+	// Must have Data field with pool reference and LP token amount
+	if len(tx.Data) == 0 {
+		return fmt.Errorf("remove liquidity transaction must have pool data in Data field")
+	}
+
+	// Must be signed
+	if len(tx.Signature) == 0 {
+		return fmt.Errorf("remove liquidity transaction must be signed")
+	}
+
+	// Validate signature
+	if len(tx.PublicKey) > 0 {
+		publicKey, err := PublicKeyFromBytes(tx.PublicKey)
+		if err != nil {
+			return fmt.Errorf("invalid public key: %w", err)
+		}
+
+		hash, err := tx.Hash()
+		if err != nil {
+			return fmt.Errorf("failed to compute transaction hash: %w", err)
+		}
+
+		if !VerifySignature(hash, tx.Signature, publicKey) {
+			return fmt.Errorf("invalid transaction signature")
+		}
+	}
+
+	return nil
+}
+
+// validateSwapTransaction validates swap transactions
+func validateSwapTransaction(tx *Transaction) error {
+	// Must have inputs (tokens being swapped)
+	if len(tx.Inputs) == 0 {
+		return fmt.Errorf("swap transaction must have inputs")
+	}
+
+	// Must have Data field with pool reference and swap details
+	if len(tx.Data) == 0 {
+		return fmt.Errorf("swap transaction must have swap data in Data field")
+	}
+
+	// Must be signed
+	if len(tx.Signature) == 0 {
+		return fmt.Errorf("swap transaction must be signed")
+	}
+
+	// Validate signature
+	if len(tx.PublicKey) > 0 {
+		publicKey, err := PublicKeyFromBytes(tx.PublicKey)
+		if err != nil {
+			return fmt.Errorf("invalid public key: %w", err)
+		}
+
+		hash, err := tx.Hash()
+		if err != nil {
+			return fmt.Errorf("failed to compute transaction hash: %w", err)
+		}
+
+		if !VerifySignature(hash, tx.Signature, publicKey) {
+			return fmt.Errorf("invalid transaction signature")
+		}
+	}
+
+	return nil
 }

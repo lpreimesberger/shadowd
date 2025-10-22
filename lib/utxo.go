@@ -18,11 +18,32 @@ const (
 	// TxTypeMintToken creates new custom tokens on the blockchain
 	TxTypeMintToken TxType = 2
 
-	// TxTypeMelt explicitly destroys tokens/assets (e.g., revoking swap offers)
+	// TxTypeMelt explicitly destroys tokens/assets and unlocks collateral
 	TxTypeMelt TxType = 3
 
 	// TxTypeRegisterValidator registers a validator's wallet address for block rewards
 	TxTypeRegisterValidator TxType = 4
+
+	// TxTypeOffer creates an atomic swap offer (locks tokens for exchange)
+	TxTypeOffer TxType = 5
+
+	// TxTypeAcceptOffer accepts and executes an atomic swap offer
+	TxTypeAcceptOffer TxType = 6
+
+	// TxTypeCancelOffer cancels an offer and returns locked tokens
+	TxTypeCancelOffer TxType = 7
+
+	// TxTypeCreatePool creates a liquidity pool for a token pair
+	TxTypeCreatePool TxType = 8
+
+	// TxTypeAddLiquidity adds liquidity to an existing pool
+	TxTypeAddLiquidity TxType = 9
+
+	// TxTypeRemoveLiquidity removes liquidity from a pool
+	TxTypeRemoveLiquidity TxType = 10
+
+	// TxTypeSwap swaps tokens through a liquidity pool
+	TxTypeSwap TxType = 11
 )
 
 // String returns the string representation of a transaction type
@@ -38,6 +59,20 @@ func (tt TxType) String() string {
 		return "melt"
 	case TxTypeRegisterValidator:
 		return "register_validator"
+	case TxTypeOffer:
+		return "offer"
+	case TxTypeAcceptOffer:
+		return "accept_offer"
+	case TxTypeCancelOffer:
+		return "cancel_offer"
+	case TxTypeCreatePool:
+		return "create_pool"
+	case TxTypeAddLiquidity:
+		return "add_liquidity"
+	case TxTypeRemoveLiquidity:
+		return "remove_liquidity"
+	case TxTypeSwap:
+		return "swap"
 	default:
 		return fmt.Sprintf("unknown(%d)", int(tt))
 	}

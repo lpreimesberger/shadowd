@@ -270,6 +270,17 @@ func (tr *TokenRegistry) RegisterToken(tokenInfo *TokenInfo) error {
 	return nil
 }
 
+// UpdateToken updates an existing token's information (e.g., supply changes)
+func (tr *TokenRegistry) UpdateToken(tokenInfo *TokenInfo) error {
+	if _, exists := tr.Tokens[tokenInfo.TokenID]; !exists {
+		return fmt.Errorf("token %s not found", tokenInfo.TokenID)
+	}
+
+	// Update the token (validation skipped since it's an update, not initial registration)
+	tr.Tokens[tokenInfo.TokenID] = tokenInfo
+	return nil
+}
+
 // CheckTickerAvailable returns error if ticker is in use by an active token
 func (tr *TokenRegistry) CheckTickerAvailable(ticker string) error {
 	for _, token := range tr.Tokens {

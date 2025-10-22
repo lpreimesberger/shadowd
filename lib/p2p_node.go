@@ -18,6 +18,7 @@ type P2PBlockchainNode struct {
 	Chain     *Blockchain
 	Consensus *ConsensusEngine
 	apiPort   int
+	apiKey    string // Optional API key for write endpoints
 }
 
 // NewP2PBlockchainNode creates a new blockchain node
@@ -102,23 +103,47 @@ func NewP2PBlockchainNode(p2pPort, apiPort int, config *CLIConfig) (*P2PBlockcha
 		Chain:     chain,
 		Consensus: consensus,
 		apiPort:   apiPort,
+		apiKey:    config.APIKey, // Set from config
 	}
 
 	// Start HTTP API
 	go node.startAPI()
 
 	fmt.Printf("[Node] Started with P2P on port %d, API on port %d\n", p2pPort, apiPort)
+	if node.apiKey != "" {
+		fmt.Printf("[Node] 🔒 API key authentication enabled for write endpoints\n")
+	}
 	fmt.Printf("[Node] Wallet address: %s\n", wallet.Address.String())
 
 	return node, nil
+}
+
+// requireAuth is middleware that checks API key for write endpoints
+func (n *P2PBlockchainNode) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// If no API key configured, allow all requests
+		if n.apiKey == "" {
+			next(w, r)
+			return
+		}
+
+		// Check X-API-Key header
+		providedKey := r.Header.Get("X-API-Key")
+		if providedKey != n.apiKey {
+			http.Error(w, "Unauthorized: Invalid or missing API key", http.StatusUnauthorized)
+			return
+		}
+
+		next(w, r)
+	}
 }
 
 // startAPI starts the HTTP API server
 func (n *P2PBlockchainNode) startAPI() {
 	mux := http.NewServeMux()
 
-	// Submit transaction endpoint
-	mux.HandleFunc("/api/tx/submit", n.handleSubmitTransaction)
+	// Submit transaction endpoint (protected)
+	mux.HandleFunc("/api/tx/submit", n.requireAuth(n.handleSubmitTransaction))
 
 	// Get mempool endpoint
 	mux.HandleFunc("/api/mempool", n.handleGetMempool)
@@ -126,8 +151,8 @@ func (n *P2PBlockchainNode) startAPI() {
 	// Get transaction by ID
 	mux.HandleFunc("/api/tx/", n.handleGetTransaction)
 
-	// Create and send transaction endpoint
-	mux.HandleFunc("/api/tx/send", n.handleSendTransaction)
+	// Create and send transaction endpoint (protected)
+	mux.HandleFunc("/api/tx/send", n.requireAuth(n.handleSendTransaction))
 
 	// Peer status endpoint
 	mux.HandleFunc("/api/peers", n.handleGetPeers)
@@ -144,7 +169,7 @@ func (n *P2PBlockchainNode) startAPI() {
 	mux.HandleFunc("/api/balance", n.handleGetBalance)
 	mux.HandleFunc("/api/utxos", n.handleGetUTXOs)
 	mux.HandleFunc("/api/transactions", n.handleGetTransactions)
-	mux.HandleFunc("/api/transactions/send", n.handleSendTransaction) // Alias for /api/tx/send
+	mux.HandleFunc("/api/transactions/send", n.requireAuth(n.handleSendTransaction)) // Alias (protected)
 
 	// Node and wallet info
 	mux.HandleFunc("/api/status", n.handleGetStatus)
@@ -153,8 +178,24 @@ func (n *P2PBlockchainNode) startAPI() {
 	// Token endpoints
 	mux.HandleFunc("/api/tokens", n.handleGetTokens)
 	mux.HandleFunc("/api/token/info", n.handleGetTokenInfo)
-	mux.HandleFunc("/api/token/mint", n.handleMintToken)
-	mux.HandleFunc("/api/token/melt", n.handleMeltToken)
+	mux.HandleFunc("/api/token/mint", n.requireAuth(n.handleMintToken))       // Protected
+	mux.HandleFunc("/api/token/melt", n.requireAuth(n.handleMeltToken))       // Protected
+
+	// Swap endpoints
+	mux.HandleFunc("/api/swap/offer", n.requireAuth(n.handleCreateOffer))     // Protected
+	mux.HandleFunc("/api/swap/accept", n.requireAuth(n.handleAcceptOffer))    // Protected
+	mux.HandleFunc("/api/swap/cancel", n.requireAuth(n.handleCancelOffer))    // Protected
+	mux.HandleFunc("/api/swap/list", n.handleListOffers)
+
+	// Pool endpoints
+	mux.HandleFunc("/api/pool/create", n.requireAuth(n.handleCreatePool))              // Protected
+	mux.HandleFunc("/api/pool/list", n.handleListPools)
+	mux.HandleFunc("/api/pool/add_liquidity", n.requireAuth(n.handleAddLiquidity))     // Protected
+	mux.HandleFunc("/api/pool/remove_liquidity", n.requireAuth(n.handleRemoveLiquidity)) // Protected
+	mux.HandleFunc("/api/pool/swap", n.requireAuth(n.handleSwap))                      // Protected
+
+	// Mempool management
+	mux.HandleFunc("/api/mempool/cancel", n.requireAuth(n.handleCancelMempoolTx)) // Protected
 
 	// Health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -225,6 +266,47 @@ func (n *P2PBlockchainNode) handleGetTransaction(w http.ResponseWriter, r *http.
 	json.NewEncoder(w).Encode(tx)
 }
 
+// handleCancelMempoolTx allows users to cancel their own pending transactions
+func (n *P2PBlockchainNode) handleCancelMempoolTx(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		TxID      string `json:"tx_id"`
+		PublicKey []byte `json:"public_key"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Get the transaction from mempool
+	tx, exists := n.Mempool.GetTransaction(req.TxID)
+	if !exists {
+		http.Error(w, "Transaction not found in mempool", http.StatusNotFound)
+		return
+	}
+
+	// Verify the caller owns this transaction by checking the signature public key
+	// Extract public key from transaction signature
+	if !tx.VerifyOwnership(req.PublicKey) {
+		http.Error(w, "Unauthorized: You don't own this transaction", http.StatusForbidden)
+		return
+	}
+
+	// Remove from mempool
+	n.Mempool.RemoveTransaction(req.TxID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("Transaction %s cancelled", req.TxID[:16]),
+	})
+}
+
 // handleSendTransaction creates and sends a transaction
 func (n *P2PBlockchainNode) handleSendTransaction(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -287,13 +369,25 @@ func (n *P2PBlockchainNode) handleSendTransaction(w http.ResponseWriter, r *http
 		}
 	}
 
-	// Select token UTXOs to cover the amount
+	// Estimate fee first to know how much we need
+	estimatedFee := req.Fee
+	if estimatedFee == 0 {
+		estimatedFee = 11500 // Default minimum fee
+	}
+
+	// If sending SHADOW, we need to cover amount + fee from same UTXOs
+	requiredAmount := req.Amount
+	if tokenID == genesisTokenID {
+		requiredAmount = req.Amount + estimatedFee
+	}
+
+	// Select token UTXOs to cover the required amount
 	var selectedTokenUTXOs []*UTXO
 	var tokenTotal uint64
 	for _, utxo := range availableTokenUTXOs {
 		selectedTokenUTXOs = append(selectedTokenUTXOs, utxo)
 		tokenTotal += utxo.Output.Amount
-		if tokenTotal >= req.Amount {
+		if tokenTotal >= requiredAmount {
 			break
 		}
 	}
@@ -804,11 +898,29 @@ func (n *P2PBlockchainNode) handleMintToken(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Filter for SHADOW UTXOs
+	// Filter for SHADOW UTXOs and calculate required amount
+	// Calculate total supply and estimated fee first
+	totalSupply := req.MaxMint
+	for i := uint8(0); i < req.MaxDecimals; i++ {
+		totalSupply *= 10
+	}
+
+	// Estimate fee (will be recalculated in CreateTokenMintTransaction)
+	estimatedFee := CalculateTxFee(TxTypeMintToken, 10, 2, 0) // Estimate ~10 inputs
+	requiredAmount := totalSupply + estimatedFee
+
+	// Select only enough UTXOs to cover the required amount
 	var shadowUTXOs []*UTXO
+	totalSelected := uint64(0)
 	for _, utxo := range utxos {
 		if utxo.Output.TokenID == shadowTokenID {
 			shadowUTXOs = append(shadowUTXOs, utxo)
+			totalSelected += utxo.Output.Amount
+
+			// Stop once we have enough (with some buffer for fee adjustment)
+			if totalSelected >= requiredAmount*2 {
+				break
+			}
 		}
 	}
 
@@ -930,6 +1042,561 @@ func (n *P2PBlockchainNode) handleMeltToken(w http.ResponseWriter, r *http.Reque
 		"tx_id":        txID,
 		"melted_amount": meltAmount,
 		"message":       fmt.Sprintf("Melted %d tokens", meltAmount),
+	})
+}
+
+// handleCreateOffer creates a new atomic swap offer
+func (n *P2PBlockchainNode) handleCreateOffer(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		HaveTokenID    string `json:"have_token_id"`
+		WantTokenID    string `json:"want_token_id"`
+		HaveAmount     uint64 `json:"have_amount"`
+		WantAmount     uint64 `json:"want_amount"`
+		ExpiresAtBlock uint64 `json:"expires_at_block"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate inputs
+	if req.HaveTokenID == "" || req.WantTokenID == "" {
+		http.Error(w, "have_token_id and want_token_id are required", http.StatusBadRequest)
+		return
+	}
+
+	if req.HaveAmount == 0 || req.WantAmount == 0 {
+		http.Error(w, "amounts must be greater than zero", http.StatusBadRequest)
+		return
+	}
+
+	currentHeight := n.Chain.GetHeight()
+	if req.ExpiresAtBlock == 0 {
+		// Default to 2 weeks of blocks (~10 second blocks = 120960 blocks)
+		req.ExpiresAtBlock = currentHeight + 120960
+	}
+
+	if req.ExpiresAtBlock <= currentHeight {
+		http.Error(w, "expires_at_block must be in the future", http.StatusBadRequest)
+		return
+	}
+
+	// Create offer transaction
+	tx, err := CreateOfferTransaction(
+		n.Wallet,
+		n.Chain.GetUTXOStore(),
+		req.HaveTokenID,
+		req.WantTokenID,
+		req.HaveAmount,
+		req.WantAmount,
+		req.ExpiresAtBlock,
+	)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create offer: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Add to mempool (gossips automatically)
+	txID, _ := tx.ID()
+	if err := n.Mempool.AddTransaction(tx); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to add to mempool: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"tx_id":     txID,
+		"status":    "offer_created",
+		"expires_at": req.ExpiresAtBlock,
+	})
+}
+
+// handleAcceptOffer accepts an existing swap offer
+func (n *P2PBlockchainNode) handleAcceptOffer(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		OfferTxID string `json:"offer_tx_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.OfferTxID == "" {
+		http.Error(w, "offer_tx_id is required", http.StatusBadRequest)
+		return
+	}
+
+	currentHeight := n.Chain.GetHeight()
+
+	// Create accept transaction
+	tx, err := CreateAcceptOfferTransaction(
+		n.Wallet,
+		n.Chain.GetUTXOStore(),
+		req.OfferTxID,
+		currentHeight,
+	)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to accept offer: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Add to mempool (gossips automatically)
+	txID, _ := tx.ID()
+	if err := n.Mempool.AddTransaction(tx); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to add to mempool: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"tx_id":      txID,
+		"status":     "offer_accepted",
+		"offer_tx_id": req.OfferTxID,
+	})
+}
+
+// handleCancelOffer cancels an existing swap offer
+func (n *P2PBlockchainNode) handleCancelOffer(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		OfferTxID string `json:"offer_tx_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.OfferTxID == "" {
+		http.Error(w, "offer_tx_id is required", http.StatusBadRequest)
+		return
+	}
+
+	currentHeight := n.Chain.GetHeight()
+
+	// Create cancel transaction
+	tx, err := CreateCancelOfferTransaction(
+		n.Wallet,
+		n.Chain.GetUTXOStore(),
+		req.OfferTxID,
+		currentHeight,
+	)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to cancel offer: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Add to mempool and gossip
+	// Add to mempool (gossips automatically)
+	txID, _ := tx.ID()
+	if err := n.Mempool.AddTransaction(tx); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to add to mempool: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"tx_id":      txID,
+		"status":     "offer_cancelled",
+		"offer_tx_id": req.OfferTxID,
+	})
+}
+
+// isOfferConsumed checks if an offer has been accepted or cancelled
+func (n *P2PBlockchainNode) isOfferConsumed(offerTxID string, utxoStore *UTXOStore) bool {
+	currentHeight := n.Chain.GetHeight()
+
+	// Scan all blocks for accept/cancel transactions referencing this offer
+	for i := uint64(0); i < currentHeight; i++ {
+		block := n.Chain.GetBlock(i)
+		if block == nil {
+			continue
+		}
+
+		for _, txID := range block.Transactions {
+			tx, err := utxoStore.GetTransaction(txID)
+			if err != nil || tx == nil {
+				continue
+			}
+
+			// Check if this is an accept or cancel transaction
+			if tx.TxType == TxTypeAcceptOffer {
+				var acceptData AcceptOfferData
+				if err := json.Unmarshal(tx.Data, &acceptData); err == nil {
+					if acceptData.OfferTxID == offerTxID {
+						return true
+					}
+				}
+			} else if tx.TxType == TxTypeCancelOffer {
+				var cancelData CancelOfferData
+				if err := json.Unmarshal(tx.Data, &cancelData); err == nil {
+					if cancelData.OfferTxID == offerTxID {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// handleListOffers lists all active swap offers
+func (n *P2PBlockchainNode) handleListOffers(w http.ResponseWriter, r *http.Request) {
+	currentHeight := n.Chain.GetHeight()
+	utxoStore := n.Chain.GetUTXOStore()
+
+	// Scan blockchain for offer transactions
+	offers := make([]map[string]interface{}, 0)
+
+	// Get all blocks (we'll optimize this later if needed)
+	for i := uint64(0); i < currentHeight; i++ {
+		block := n.Chain.GetBlock(i)
+		if block == nil {
+			continue
+		}
+
+		// Check each transaction in the block
+		for _, txID := range block.Transactions {
+			tx, err := utxoStore.GetTransaction(txID)
+			if err != nil || tx == nil {
+				continue
+			}
+
+			// Only process offer transactions
+			if tx.TxType != TxTypeOffer {
+				continue
+			}
+
+			// Parse offer data
+			var offerData OfferData
+			if err := json.Unmarshal(tx.Data, &offerData); err != nil {
+				continue
+			}
+
+			// Check if offer is expired
+			if currentHeight > offerData.ExpiresAtBlock {
+				continue
+			}
+
+			// Check if offer has been consumed (accepted or cancelled)
+			// An offer is consumed if there's an accept/cancel tx referencing it
+			isConsumed := n.isOfferConsumed(txID, utxoStore)
+			if isConsumed {
+				continue
+			}
+
+			// This is an active offer!
+			offers = append(offers, map[string]interface{}{
+				"offer_tx_id":     txID,
+				"have_token_id":   offerData.HaveTokenID,
+				"want_token_id":   offerData.WantTokenID,
+				"have_amount":     offerData.HaveAmount,
+				"want_amount":     offerData.WantAmount,
+				"expires_at_block": offerData.ExpiresAtBlock,
+				"offer_address":   offerData.OfferAddress.String(),
+				"block_height":    i,
+			})
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"offers":        offers,
+		"count":         len(offers),
+		"current_height": currentHeight,
+	})
+}
+
+// handleCreatePool handles pool creation requests
+func (n *P2PBlockchainNode) handleCreatePool(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		TokenA     string `json:"token_a"`
+		TokenB     string `json:"token_b"`
+		AmountA    uint64 `json:"amount_a"`
+		AmountB    uint64 `json:"amount_b"`
+		FeePercent uint64 `json:"fee_percent"` // Optional, defaults to 30 (0.3%)
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Default fee to 0.3% if not specified
+	if req.FeePercent == 0 {
+		req.FeePercent = 30
+	}
+
+	// Validate fee is in range
+	if err := ValidateFeePercent(req.FeePercent); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid fee: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Get stores
+	utxoStore := n.Chain.GetUTXOStore()
+	tokenRegistry := GetGlobalTokenRegistry()
+	poolRegistry := n.Chain.GetPoolRegistry()
+
+	// Check if pool already exists for this token pair (in either order)
+	existingPools := poolRegistry.GetAllPools()
+	for _, pool := range existingPools {
+		if (pool.TokenA == req.TokenA && pool.TokenB == req.TokenB) ||
+			(pool.TokenA == req.TokenB && pool.TokenB == req.TokenA) {
+			http.Error(w, fmt.Sprintf("Pool already exists for this token pair: %s/%s (pool ID: %s)",
+				req.TokenA[:8], req.TokenB[:8], pool.PoolID[:16]), http.StatusConflict)
+			return
+		}
+	}
+
+	fmt.Printf("[API] Creating pool transaction: %s/%s amounts: %d/%d fee: %d\n",
+		req.TokenA[:8], req.TokenB[:8], req.AmountA, req.AmountB, req.FeePercent)
+
+	// Create pool transaction
+	tx, err := CreatePoolTransaction(n.Wallet, utxoStore, tokenRegistry,
+		req.TokenA, req.TokenB, req.AmountA, req.AmountB, req.FeePercent)
+	if err != nil {
+		fmt.Printf("[API] Failed to create pool transaction: %v\n", err)
+		http.Error(w, fmt.Sprintf("Failed to create pool transaction: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	txID, _ := tx.ID()
+	fmt.Printf("[API] Created pool transaction: %s (type: %d, inputs: %d, outputs: %d)\n",
+		txID[:16], tx.TxType, len(tx.Inputs), len(tx.Outputs))
+
+	// Add to mempool
+	fmt.Printf("[API] Adding transaction to mempool: %s\n", txID[:16])
+	if err := n.Mempool.AddTransaction(tx); err != nil {
+		fmt.Printf("[API] Failed to add to mempool: %v\n", err)
+		http.Error(w, fmt.Sprintf("Failed to add to mempool: %v", err), http.StatusInternalServerError)
+		return
+	}
+	fmt.Printf("[API] Successfully added transaction to mempool: %s\n", txID[:16])
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"tx_id":  txID,
+		"status": "pool_creation_submitted",
+		"pool_id": txID, // Pool ID is the creation transaction ID
+	})
+}
+
+// handleListPools lists all active liquidity pools
+func (n *P2PBlockchainNode) handleListPools(w http.ResponseWriter, r *http.Request) {
+	poolRegistry := n.Chain.GetPoolRegistry()
+	tokenRegistry := GetGlobalTokenRegistry()
+
+	pools := poolRegistry.GetAllPools()
+
+	poolList := make([]map[string]interface{}, 0, len(pools))
+	for _, pool := range pools {
+		// Get token info for display
+		tokenA, _ := tokenRegistry.GetToken(pool.TokenA)
+		tokenB, _ := tokenRegistry.GetToken(pool.TokenB)
+		lpToken, _ := tokenRegistry.GetToken(pool.LPTokenID)
+
+		// Calculate current exchange rate
+		var rateAtoB, rateBtoA float64
+		if pool.ReserveB > 0 {
+			rateAtoB = float64(pool.ReserveA) / float64(pool.ReserveB)
+		}
+		if pool.ReserveA > 0 {
+			rateBtoA = float64(pool.ReserveB) / float64(pool.ReserveA)
+		}
+
+		poolInfo := map[string]interface{}{
+			"pool_id":       pool.PoolID,
+			"token_a":       pool.TokenA,
+			"token_a_ticker": "",
+			"token_b":       pool.TokenB,
+			"token_b_ticker": "",
+			"reserve_a":     pool.ReserveA,
+			"reserve_b":     pool.ReserveB,
+			"lp_token_id":   pool.LPTokenID,
+			"lp_token_ticker": "",
+			"lp_token_supply": pool.LPTokenSupply,
+			"fee_percent":   pool.FeePercent,
+			"k":             pool.K,
+			"rate_a_to_b":   rateAtoB,
+			"rate_b_to_a":   rateBtoA,
+			"created_at":    pool.CreatedAt,
+		}
+
+		if tokenA != nil {
+			poolInfo["token_a_ticker"] = tokenA.Ticker
+		}
+		if tokenB != nil {
+			poolInfo["token_b_ticker"] = tokenB.Ticker
+		}
+		if lpToken != nil {
+			poolInfo["lp_token_ticker"] = lpToken.Ticker
+		}
+
+		poolList = append(poolList, poolInfo)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"pools": poolList,
+		"count": len(poolList),
+	})
+}
+
+// handleAddLiquidity handles add liquidity requests
+func (n *P2PBlockchainNode) handleAddLiquidity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		PoolID      string `json:"pool_id"`
+		AmountA     uint64 `json:"amount_a"`
+		AmountB     uint64 `json:"amount_b"`
+		MinLPTokens uint64 `json:"min_lp_tokens"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Get stores
+	utxoStore := n.Chain.GetUTXOStore()
+	poolRegistry := n.Chain.GetPoolRegistry()
+
+	// Create add liquidity transaction
+	tx, err := CreateAddLiquidityTransaction(n.Wallet, utxoStore, poolRegistry,
+		req.PoolID, req.AmountA, req.AmountB, req.MinLPTokens)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create transaction: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Add to mempool
+	if err := n.Mempool.AddTransaction(tx); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to add to mempool: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	txID, _ := tx.ID()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"tx_id":  txID,
+		"status": "add_liquidity_submitted",
+	})
+}
+
+// handleRemoveLiquidity handles remove liquidity requests
+func (n *P2PBlockchainNode) handleRemoveLiquidity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		PoolID     string `json:"pool_id"`
+		LPTokens   uint64 `json:"lp_tokens"`
+		MinAmountA uint64 `json:"min_amount_a"`
+		MinAmountB uint64 `json:"min_amount_b"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Get stores
+	utxoStore := n.Chain.GetUTXOStore()
+	poolRegistry := n.Chain.GetPoolRegistry()
+
+	// Create remove liquidity transaction
+	tx, err := CreateRemoveLiquidityTransaction(n.Wallet, utxoStore, poolRegistry,
+		req.PoolID, req.LPTokens, req.MinAmountA, req.MinAmountB)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create transaction: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Add to mempool
+	if err := n.Mempool.AddTransaction(tx); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to add to mempool: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	txID, _ := tx.ID()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"tx_id":  txID,
+		"status": "remove_liquidity_submitted",
+	})
+}
+
+// handleSwap handles token swap requests
+func (n *P2PBlockchainNode) handleSwap(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		PoolID       string `json:"pool_id"`
+		TokenIn      string `json:"token_in"`
+		AmountIn     uint64 `json:"amount_in"`
+		MinAmountOut uint64 `json:"min_amount_out"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Get stores
+	utxoStore := n.Chain.GetUTXOStore()
+	poolRegistry := n.Chain.GetPoolRegistry()
+
+	// Create swap transaction
+	tx, err := CreateSwapTransaction(n.Wallet, utxoStore, poolRegistry,
+		req.PoolID, req.TokenIn, req.AmountIn, req.MinAmountOut)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create transaction: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Add to mempool
+	if err := n.Mempool.AddTransaction(tx); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to add to mempool: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	txID, _ := tx.ID()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"tx_id":  txID,
+		"status": "swap_submitted",
 	})
 }
 

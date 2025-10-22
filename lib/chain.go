@@ -25,10 +25,11 @@ type Block struct {
 
 // Blockchain represents the chain of blocks
 type Blockchain struct {
-	blocks    []*Block
-	store     *BlockStore
-	utxoStore *UTXOStore
-	chainLock sync.RWMutex
+	blocks       []*Block
+	store        *BlockStore
+	utxoStore    *UTXOStore
+	poolRegistry *PoolRegistry
+	chainLock    sync.RWMutex
 }
 
 // NewBlockchain creates a new blockchain with a genesis block
@@ -52,10 +53,14 @@ func NewBlockchain(storePath string) (*Blockchain, error) {
 	}
 	fmt.Printf("[Chain] UTXO store opened successfully\n")
 
+	// Create pool registry
+	poolRegistry := NewPoolRegistry()
+
 	bc := &Blockchain{
-		blocks:    make([]*Block, 0),
-		store:     store,
-		utxoStore: utxoStore,
+		blocks:       make([]*Block, 0),
+		store:        store,
+		utxoStore:    utxoStore,
+		poolRegistry: poolRegistry,
 	}
 
 	// Try to load existing chain from storage
@@ -94,6 +99,12 @@ func NewBlockchain(storePath string) (*Blockchain, error) {
 		fmt.Printf("[Chain] Rebuilding token registry from blockchain...\n")
 		if err := bc.rebuildTokenRegistry(); err != nil {
 			fmt.Printf("[Chain] Warning: Failed to rebuild token registry: %v\n", err)
+		}
+
+		// Rebuild pool registry from blockchain
+		fmt.Printf("[Chain] Rebuilding pool registry from blockchain...\n")
+		if err := bc.rebuildPoolRegistry(); err != nil {
+			fmt.Printf("[Chain] Warning: Failed to rebuild pool registry: %v\n", err)
 		}
 	} else {
 		// Create new genesis block
@@ -237,7 +248,8 @@ func (bc *Blockchain) AddBlock(block *Block, mempool *Mempool) error {
 				return fmt.Errorf("failed to add coinbase UTXO: %w", err)
 			}
 		}
-		fmt.Printf("[Chain] Processed coinbase tx for block %d: %s\n", block.Index, coinbaseID[:16])
+		// Logging disabled for sync performance
+		// fmt.Printf("[Chain] Processed coinbase tx for block %d: %s\n", block.Index, coinbaseID[:16])
 	}
 
 	// Process regular transactions from mempool
@@ -264,7 +276,7 @@ func (bc *Blockchain) AddBlock(block *Block, mempool *Mempool) error {
 		}
 
 		// Handle token-specific operations FIRST (updates tx.Outputs[].TokenID from PENDING to actual)
-		if err := bc.utxoStore.ProcessTokenTransaction(tx, tokenRegistry); err != nil {
+		if err := bc.utxoStore.ProcessTokenTransaction(tx, tokenRegistry, bc.poolRegistry, int64(block.Index)); err != nil {
 			fmt.Printf("[Chain] Warning: Failed to process token transaction %s: %v\n", txID[:16], err)
 		}
 
@@ -289,7 +301,8 @@ func (bc *Blockchain) AddBlock(block *Block, mempool *Mempool) error {
 			}
 		}
 
-		fmt.Printf("[Chain] Applied transaction %s (type: %s)\n", txID[:16], tx.TxType.String())
+		// Logging disabled for sync performance
+		// fmt.Printf("[Chain] Applied transaction %s (type: %s)\n", txID[:16], tx.TxType.String())
 	}
 
 	// Persist to storage
@@ -298,7 +311,13 @@ func (bc *Blockchain) AddBlock(block *Block, mempool *Mempool) error {
 	}
 
 	bc.blocks = append(bc.blocks, block)
-	fmt.Printf("[Chain] Added block %d to chain, height now: %d\n", block.Index, len(bc.blocks))
+	fmt.Printf("🟢 [BLOCK ADDED] Height: %d | TxCount: %d | Hash: %s | Proposer: %s\n",
+		block.Index, len(block.Transactions), block.Hash[:16], block.Proposer[:16])
+
+	// Purge mempool transactions with now-spent inputs
+	if mempool != nil {
+		mempool.PurgeInvalidTransactions(bc.utxoStore)
+	}
 
 	return nil
 }
@@ -361,6 +380,111 @@ func (bc *Blockchain) rebuildTokenRegistry() error {
 	}
 
 	fmt.Printf("[Chain] Token registry rebuilt: %d custom tokens restored\n", tokenCount)
+	return nil
+}
+
+// rebuildPoolRegistry scans all blocks and rebuilds the pool registry from create pool transactions
+func (bc *Blockchain) rebuildPoolRegistry() error {
+	poolCount := 0
+
+	// Scan all blocks for create pool transactions
+	for _, block := range bc.blocks {
+		// Process all transactions in the block
+		for _, txID := range block.Transactions {
+			tx, err := bc.utxoStore.GetTransaction(txID)
+			if err != nil || tx == nil {
+				continue
+			}
+
+			// Only process create pool transactions
+			if tx.TxType == TxTypeCreatePool {
+				// Extract pool metadata
+				var poolData CreatePoolData
+				if err := json.Unmarshal(tx.Data, &poolData); err != nil {
+					fmt.Printf("[Chain] Warning: Failed to parse pool data for tx %s: %v\n", txID[:16], err)
+					continue
+				}
+
+				// Calculate LP tokens (same logic as in utxo_store.go)
+				lpTokenAmount := CalculateLPTokens(poolData.AmountA, poolData.AmountB)
+
+				// Adjust to match validation (MaxMint * 10^MaxDecimals)
+				lpMaxDecimals := uint8(8)
+				divisor := uint64(1)
+				for i := uint8(0); i < lpMaxDecimals; i++ {
+					divisor *= 10
+				}
+				lpMaxMint := lpTokenAmount / divisor
+				if lpMaxMint == 0 {
+					lpMaxMint = 1
+				}
+				expectedSupply := lpMaxMint
+				for i := uint8(0); i < lpMaxDecimals; i++ {
+					expectedSupply *= 10
+				}
+
+				// Create liquidity pool
+				pool := &LiquidityPool{
+					PoolID:        txID,
+					TokenA:        poolData.TokenA,
+					TokenB:        poolData.TokenB,
+					ReserveA:      poolData.AmountA,
+					ReserveB:      poolData.AmountB,
+					LPTokenID:     txID,
+					LPTokenSupply: expectedSupply,
+					FeePercent:    poolData.FeePercent,
+					K:             CalculateK(poolData.AmountA, poolData.AmountB),
+					CreatedAt:     block.Index,
+				}
+
+				// Get token info for LP token ticker generation
+				tokenRegistry := GetGlobalTokenRegistry()
+				tokenA, existsA := tokenRegistry.GetToken(poolData.TokenA)
+				tokenB, existsB := tokenRegistry.GetToken(poolData.TokenB)
+
+				if !existsA || !existsB {
+					fmt.Printf("[Chain] Warning: Cannot restore pool %s - tokens not found\n", txID[:16])
+					continue
+				}
+
+				// Create LP token ticker with pool ID to ensure uniqueness
+				lpTokenTicker := GetLPTokenName(tokenA.Ticker, tokenB.Ticker, txID)
+
+				// Create LP token info
+				lpTokenInfo := &TokenInfo{
+					TokenID:        txID,
+					Ticker:         lpTokenTicker,
+					Desc:           fmt.Sprintf("%s%sLiquidityPool", tokenA.Ticker, tokenB.Ticker),
+					MaxMint:        lpMaxMint,
+					MaxDecimals:    lpMaxDecimals,
+					TotalSupply:    expectedSupply,
+					LockedShadow:   expectedSupply,
+					TotalMelted:    0,
+					MintVersion:    0,
+					CreatorAddress: poolData.PoolAddress,
+					CreationTime:   int64(block.Index),
+				}
+
+				// Register LP token in token registry
+				if err := tokenRegistry.RegisterToken(lpTokenInfo); err != nil {
+					// Ignore duplicate registration errors
+					fmt.Printf("[Chain] Warning: Failed to register LP token for pool %s: %v\n", txID[:16], err)
+				}
+
+				// Register pool
+				if err := bc.poolRegistry.RegisterPool(pool); err != nil {
+					// Ignore duplicate registration errors
+					continue
+				}
+
+				poolCount++
+				fmt.Printf("[Chain] Restored pool: %s (ID: %s, LP token: %s)\n",
+					txID[:16], txID[:16], lpTokenTicker)
+			}
+		}
+	}
+
+	fmt.Printf("[Chain] Pool registry rebuilt: %d pools restored\n", poolCount)
 	return nil
 }
 
@@ -432,6 +556,11 @@ func (bc *Blockchain) PrintChain() {
 // GetUTXOStore returns the UTXO store for this blockchain
 func (bc *Blockchain) GetUTXOStore() *UTXOStore {
 	return bc.utxoStore
+}
+
+// GetPoolRegistry returns the pool registry for this blockchain
+func (bc *Blockchain) GetPoolRegistry() *PoolRegistry {
+	return bc.poolRegistry
 }
 
 // Close closes the blockchain and its storage

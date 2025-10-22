@@ -11,7 +11,7 @@ import (
 type UTXOStore struct {
 	db    *BoltDBAdapter
 	mutex sync.RWMutex
-	cache map[string]*UTXO // In-memory cache for performance
+	cache sync.Map // In-memory cache for performance (thread-safe)
 }
 
 // Prefixes for different data types in the database
@@ -34,8 +34,8 @@ func NewUTXOStore(dbPath string) (*UTXOStore, error) {
 	}
 
 	return &UTXOStore{
-		db:    db,
-		cache: make(map[string]*UTXO),
+		db: db,
+		// cache is sync.Map, no initialization needed
 	}, nil
 }
 
@@ -46,9 +46,9 @@ func (store *UTXOStore) GetUTXO(txID string, outputIndex uint32) (*UTXO, error) 
 
 	key := fmt.Sprintf("%s%s:%d", UTXOPrefix, txID, outputIndex)
 
-	// Check cache first
-	if utxo, exists := store.cache[key]; exists {
-		return utxo, nil
+	// Check cache first (sync.Map is thread-safe)
+	if cached, exists := store.cache.Load(key); exists {
+		return cached.(*UTXO), nil
 	}
 
 	// Check database
@@ -65,8 +65,8 @@ func (store *UTXOStore) GetUTXO(txID string, outputIndex uint32) (*UTXO, error) 
 		return nil, fmt.Errorf("failed to unmarshal UTXO: %w", err)
 	}
 
-	// Cache the UTXO
-	store.cache[key] = &utxo
+	// Cache the UTXO (sync.Map handles concurrency)
+	store.cache.Store(key, &utxo)
 
 	return &utxo, nil
 }
@@ -96,10 +96,10 @@ func (store *UTXOStore) AddUTXO(utxo *UTXO) error {
 		return fmt.Errorf("failed to store address index: %w", err)
 	}
 
-	// Debug: verify address was stored correctly
-	if utxo.OutputIndex == 0 {
-		fmt.Printf("[UTXO] Indexed tx %s:0 for address %s (len=%d)\n", utxo.TxID[:16], addrStr[:16], len(addrStr))
-	}
+	// Debug logging disabled during sync to improve performance
+	// if utxo.OutputIndex == 0 {
+	// 	fmt.Printf("[UTXO] Indexed tx %s:0 for address %s (len=%d)\n", utxo.TxID[:16], addrStr[:16], len(addrStr))
+	// }
 
 	// Add to height index
 	heightKey := fmt.Sprintf("%s%d:%s:%d", HeightPrefix, utxo.BlockHeight, utxo.TxID, utxo.OutputIndex)
@@ -108,7 +108,7 @@ func (store *UTXOStore) AddUTXO(utxo *UTXO) error {
 	}
 
 	// Cache the UTXO
-	store.cache[key] = utxo
+	store.cache.Store(key, utxo)
 
 	return nil
 }
@@ -122,8 +122,10 @@ func (store *UTXOStore) SpendUTXO(txID string, outputIndex uint32) error {
 	key := fmt.Sprintf("%s%s:%d", UTXOPrefix, txID, outputIndex)
 
 	// Check cache first
-	utxo, exists := store.cache[key]
-	if !exists {
+	var utxo *UTXO
+	if cached, exists := store.cache.Load(key); exists {
+		utxo = cached.(*UTXO)
+	} else {
 		// Check database
 		data, err := store.db.Get([]byte(key))
 		if err != nil {
@@ -138,7 +140,7 @@ func (store *UTXOStore) SpendUTXO(txID string, outputIndex uint32) error {
 			return fmt.Errorf("failed to unmarshal UTXO: %w", err)
 		}
 		utxo = &u
-		store.cache[key] = utxo
+		store.cache.Store(key, utxo)
 	}
 
 	if utxo.IsSpent {
@@ -164,17 +166,15 @@ func (store *UTXOStore) SpendUTXO(txID string, outputIndex uint32) error {
 		return fmt.Errorf("failed to store spent index: %w", err)
 	}
 
-	// Update cache
-	store.cache[key] = utxo
+	// Invalidate cache - force re-read from DB next time to ensure fresh data
+	store.cache.Delete(key)
 
 	return nil
 }
 
 // GetUTXOsByAddress returns all unspent UTXOs for a given address
 func (store *UTXOStore) GetUTXOsByAddress(address Address) ([]*UTXO, error) {
-	store.mutex.RLock()
-	defer store.mutex.RUnlock()
-
+	// Badger handles concurrency - no mutex needed!
 	var utxos []*UTXO
 	addrStr := address.String()
 	prefix := fmt.Sprintf("%s%s:", AddressPrefix, addrStr)
@@ -313,7 +313,11 @@ func (store *UTXOStore) ValidateTransaction(tx *Transaction) error {
 func (store *UTXOStore) ClearCache() {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
-	store.cache = make(map[string]*UTXO)
+	// Clear sync.Map by deleting all entries
+	store.cache.Range(func(key, value interface{}) bool {
+		store.cache.Delete(key)
+		return true
+	})
 }
 
 // Close closes the database connection
@@ -324,8 +328,8 @@ func (store *UTXOStore) Close() error {
 	return nil
 }
 
-// ProcessTokenTransaction handles token-specific transaction processing (mint/melt)
-func (store *UTXOStore) ProcessTokenTransaction(tx *Transaction, tokenRegistry *TokenRegistry) error {
+// ProcessTokenTransaction handles token-specific transaction processing (mint/melt/pools)
+func (store *UTXOStore) ProcessTokenTransaction(tx *Transaction, tokenRegistry *TokenRegistry, poolRegistry *PoolRegistry, blockHeight int64) error {
 	if tx == nil || tokenRegistry == nil {
 		return nil
 	}
@@ -412,6 +416,424 @@ func (store *UTXOStore) ProcessTokenTransaction(tx *Transaction, tokenRegistry *
 				break
 			}
 		}
+
+	case TxTypeOffer:
+		fmt.Printf("[SwapOffer] Processing offer transaction: %s\n", txID[:16])
+		// Offer transactions lock tokens - no special validation needed here
+		// The tokens are locked by not creating outputs for them
+		// Validation happens in CreateOfferTransaction
+
+	case TxTypeAcceptOffer:
+		fmt.Printf("[SwapOffer] Processing accept offer transaction: %s\n", txID[:16])
+		// Parse accept data to get offer transaction ID
+		var acceptData AcceptOfferData
+		if err := json.Unmarshal(tx.Data, &acceptData); err != nil {
+			return fmt.Errorf("failed to parse accept data: %w", err)
+		}
+
+		// Get the original offer transaction
+		offerTx, err := store.GetTransaction(acceptData.OfferTxID)
+		if err != nil {
+			return fmt.Errorf("failed to get offer transaction: %w", err)
+		}
+
+		// Parse offer data
+		var offerData OfferData
+		if err := json.Unmarshal(offerTx.Data, &offerData); err != nil {
+			return fmt.Errorf("failed to parse offer data: %w", err)
+		}
+
+		// Mark the offer as consumed by setting its locked UTXOs as spent
+		for _, input := range offerTx.Inputs {
+			// Only spend the token inputs (not SHADOW fee inputs)
+			utxo, err := store.GetUTXO(input.PrevTxID, input.OutputIndex)
+			if err == nil && utxo != nil && utxo.Output.TokenID == offerData.HaveTokenID {
+				if err := store.SpendUTXO(input.PrevTxID, input.OutputIndex); err != nil {
+					fmt.Printf("[SwapOffer] Warning: Failed to spend offer UTXO: %v\n", err)
+				}
+			}
+		}
+
+		fmt.Printf("[SwapOffer] ✅ Accepted offer %s: swapped %d %s for %d %s\n",
+			acceptData.OfferTxID[:16], offerData.HaveAmount, offerData.HaveTokenID[:8],
+			offerData.WantAmount, offerData.WantTokenID[:8])
+
+	case TxTypeCancelOffer:
+		fmt.Printf("[SwapOffer] Processing cancel offer transaction: %s\n", txID[:16])
+		// Parse cancel data to get offer transaction ID
+		var cancelData CancelOfferData
+		if err := json.Unmarshal(tx.Data, &cancelData); err != nil {
+			return fmt.Errorf("failed to parse cancel data: %w", err)
+		}
+
+		// Get the original offer transaction
+		offerTx, err := store.GetTransaction(cancelData.OfferTxID)
+		if err != nil {
+			return fmt.Errorf("failed to get offer transaction: %w", err)
+		}
+
+		// Parse offer data
+		var offerData OfferData
+		if err := json.Unmarshal(offerTx.Data, &offerData); err != nil {
+			return fmt.Errorf("failed to parse offer data: %w", err)
+		}
+
+		// Mark the offer as consumed by spending its locked UTXOs
+		for _, input := range offerTx.Inputs {
+			// Only spend the token inputs (not SHADOW fee inputs)
+			utxo, err := store.GetUTXO(input.PrevTxID, input.OutputIndex)
+			if err == nil && utxo != nil && utxo.Output.TokenID == offerData.HaveTokenID {
+				if err := store.SpendUTXO(input.PrevTxID, input.OutputIndex); err != nil {
+					fmt.Printf("[SwapOffer] Warning: Failed to spend offer UTXO: %v\n", err)
+				}
+			}
+		}
+
+		fmt.Printf("[SwapOffer] ✅ Cancelled offer %s\n", cancelData.OfferTxID[:16])
+
+	case TxTypeCreatePool:
+		fmt.Printf("[LiquidityPool] ⏳ START processing create pool transaction: %s\n", txID[:16])
+		// Parse pool creation data
+		var poolData CreatePoolData
+		if err := json.Unmarshal(tx.Data, &poolData); err != nil {
+			return fmt.Errorf("failed to parse pool data: %w", err)
+		}
+
+		// Validate tokens exist in registry
+		tokenA, existsA := tokenRegistry.GetToken(poolData.TokenA)
+		if !existsA {
+			return fmt.Errorf("token A not found: %s", poolData.TokenA)
+		}
+		tokenB, existsB := tokenRegistry.GetToken(poolData.TokenB)
+		if !existsB {
+			return fmt.Errorf("token B not found: %s", poolData.TokenB)
+		}
+
+		// Calculate LP tokens to mint
+		lpTokenAmount := CalculateLPTokens(poolData.AmountA, poolData.AmountB)
+		if lpTokenAmount == 0 {
+			return fmt.Errorf("LP token amount cannot be zero")
+		}
+
+		// Create LP token ticker with pool ID to ensure uniqueness
+		lpTokenTicker := GetLPTokenName(tokenA.Ticker, tokenB.Ticker, txID)
+
+		// Calculate MaxMint to satisfy validation: TotalSupply == MaxMint * 10^MaxDecimals
+		// For 8 decimals: MaxMint = TotalSupply / 10^8
+		lpMaxDecimals := uint8(8)
+		divisor := uint64(1)
+		for i := uint8(0); i < lpMaxDecimals; i++ {
+			divisor *= 10
+		}
+		lpMaxMint := lpTokenAmount / divisor
+		if lpMaxMint == 0 {
+			lpMaxMint = 1 // Minimum 1
+		}
+		// Ensure TotalSupply matches exactly
+		expectedSupply := lpMaxMint
+		for i := uint8(0); i < lpMaxDecimals; i++ {
+			expectedSupply *= 10
+		}
+
+		// Create LP token info
+		lpTokenInfo := &TokenInfo{
+			TokenID:        txID, // Use pool creation tx as LP token ID
+			Ticker:         lpTokenTicker,
+			Desc:           fmt.Sprintf("%s%sLiquidityPool", tokenA.Ticker, tokenB.Ticker),
+			MaxMint:        lpMaxMint,
+			MaxDecimals:    lpMaxDecimals,
+			TotalSupply:    expectedSupply, // Use calculated value that matches validation
+			LockedShadow:   expectedSupply, // Must equal TotalSupply for validation
+			TotalMelted:    0,
+			MintVersion:    0,
+			CreatorAddress: poolData.PoolAddress,
+			CreationTime:   blockHeight,
+		}
+
+		// Register LP token in token registry
+		if err := tokenRegistry.RegisterToken(lpTokenInfo); err != nil {
+			return fmt.Errorf("failed to register LP token: %w", err)
+		}
+
+		// Create liquidity pool (use expectedSupply for consistency)
+		pool := &LiquidityPool{
+			PoolID:        txID,
+			TokenA:        poolData.TokenA,
+			TokenB:        poolData.TokenB,
+			ReserveA:      poolData.AmountA,
+			ReserveB:      poolData.AmountB,
+			LPTokenID:     txID,
+			LPTokenSupply: expectedSupply, // Use adjusted supply
+			FeePercent:    poolData.FeePercent,
+			K:             CalculateK(poolData.AmountA, poolData.AmountB),
+			CreatedAt:     uint64(blockHeight),
+		}
+
+		// Register pool in pool registry
+		if poolRegistry != nil {
+			if err := poolRegistry.RegisterPool(pool); err != nil {
+				return fmt.Errorf("failed to register pool: %w", err)
+			}
+		}
+
+		// Create UTXO for LP tokens to pool creator (use expectedSupply)
+		lpTokenOutput := CreateTokenOutput(poolData.PoolAddress, expectedSupply, txID, "liquidity_pool", nil)
+		lpUTXO := &UTXO{
+			TxID:        txID,
+			OutputIndex: uint32(len(tx.Outputs)), // Add as next output
+			Output:      lpTokenOutput,
+			IsSpent:     false,
+		}
+		if err := store.AddUTXO(lpUTXO); err != nil {
+			return fmt.Errorf("failed to create LP token UTXO: %w", err)
+		}
+
+		fmt.Printf("[LiquidityPool] ✅ Created pool %s: %s/%s (reserves: %d/%d, LP tokens: %d)\n",
+			txID[:16], tokenA.Ticker, tokenB.Ticker, poolData.AmountA, poolData.AmountB, expectedSupply)
+
+	case TxTypeAddLiquidity:
+		fmt.Printf("[LiquidityPool] ⏳ START processing add liquidity transaction: %s\n", txID[:16])
+
+		// Parse add liquidity data
+		var addData AddLiquidityData
+		if err := json.Unmarshal(tx.Data, &addData); err != nil {
+			return fmt.Errorf("failed to parse add liquidity data: %w", err)
+		}
+
+		// Get the pool
+		pool, err := poolRegistry.GetPool(addData.PoolID)
+		if err != nil {
+			return fmt.Errorf("pool not found: %s", addData.PoolID[:16])
+		}
+
+		// Calculate LP tokens to mint based on proportional contribution
+		// LP tokens = min(amountA/reserveA, amountB/reserveB) * lpTokenSupply
+		var lpTokensToMint uint64
+		ratioA := (addData.AmountA * pool.LPTokenSupply) / pool.ReserveA
+		ratioB := (addData.AmountB * pool.LPTokenSupply) / pool.ReserveB
+
+		// Use the smaller ratio to ensure pool ratio is maintained
+		if ratioA < ratioB {
+			lpTokensToMint = ratioA
+		} else {
+			lpTokensToMint = ratioB
+		}
+
+		// Check minimum LP tokens (slippage protection)
+		if lpTokensToMint < addData.MinLPTokens {
+			return fmt.Errorf("insufficient LP tokens: would receive %d, minimum %d", lpTokensToMint, addData.MinLPTokens)
+		}
+
+		// Update pool reserves
+		pool.ReserveA += addData.AmountA
+		pool.ReserveB += addData.AmountB
+		pool.LPTokenSupply += lpTokensToMint
+		pool.K = CalculateK(pool.ReserveA, pool.ReserveB)
+
+		// Update pool in registry
+		if err := poolRegistry.UpdatePool(pool); err != nil {
+			return fmt.Errorf("failed to update pool: %w", err)
+		}
+
+		// Update LP token total supply in token registry
+		lpToken, exists := tokenRegistry.GetToken(pool.LPTokenID)
+		if !exists {
+			return fmt.Errorf("LP token not found: %s", pool.LPTokenID[:16])
+		}
+		lpToken.TotalSupply += lpTokensToMint
+		lpToken.LockedShadow += lpTokensToMint // Keep accounting consistent
+		if err := tokenRegistry.UpdateToken(lpToken); err != nil {
+			return fmt.Errorf("failed to update LP token supply: %w", err)
+		}
+
+		// Get liquidity provider address from first output (should be LP token change output)
+		var providerAddress Address
+		if len(tx.Outputs) > 0 {
+			providerAddress = tx.Outputs[0].Address
+		} else {
+			return fmt.Errorf("no outputs found for LP tokens")
+		}
+
+		// Create UTXO for LP tokens to liquidity provider
+		lpTokenOutput := CreateTokenOutput(providerAddress, lpTokensToMint, pool.LPTokenID, "liquidity_pool", nil)
+		lpUTXO := &UTXO{
+			TxID:        txID,
+			OutputIndex: uint32(len(tx.Outputs)), // Add as next output
+			Output:      lpTokenOutput,
+			IsSpent:     false,
+		}
+		if err := store.AddUTXO(lpUTXO); err != nil {
+			return fmt.Errorf("failed to create LP token UTXO: %w", err)
+		}
+
+		fmt.Printf("[LiquidityPool] ✅ Added liquidity to pool %s: +%d/%d tokens, minted %d LP tokens\n",
+			addData.PoolID[:16], addData.AmountA, addData.AmountB, lpTokensToMint)
+
+	case TxTypeRemoveLiquidity:
+		fmt.Printf("[LiquidityPool] ⏳ START processing remove liquidity transaction: %s\n", txID[:16])
+
+		// Parse remove liquidity data
+		var removeData RemoveLiquidityData
+		if err := json.Unmarshal(tx.Data, &removeData); err != nil {
+			return fmt.Errorf("failed to parse remove liquidity data: %w", err)
+		}
+
+		// Get the pool
+		pool, err := poolRegistry.GetPool(removeData.PoolID)
+		if err != nil {
+			return fmt.Errorf("pool not found: %s", removeData.PoolID[:16])
+		}
+
+		// Calculate tokens to return based on LP tokens being burned
+		// amountA = (lpTokens / lpTokenSupply) * reserveA
+		// amountB = (lpTokens / lpTokenSupply) * reserveB
+		amountAToReturn := (removeData.LPTokens * pool.ReserveA) / pool.LPTokenSupply
+		amountBToReturn := (removeData.LPTokens * pool.ReserveB) / pool.LPTokenSupply
+
+		// Check minimum amounts (slippage protection)
+		if amountAToReturn < removeData.MinAmountA {
+			return fmt.Errorf("insufficient token A: would receive %d, minimum %d", amountAToReturn, removeData.MinAmountA)
+		}
+		if amountBToReturn < removeData.MinAmountB {
+			return fmt.Errorf("insufficient token B: would receive %d, minimum %d", amountBToReturn, removeData.MinAmountB)
+		}
+
+		// Update pool reserves
+		pool.ReserveA -= amountAToReturn
+		pool.ReserveB -= amountBToReturn
+		pool.LPTokenSupply -= removeData.LPTokens
+		pool.K = CalculateK(pool.ReserveA, pool.ReserveB)
+
+		// Update pool in registry
+		if err := poolRegistry.UpdatePool(pool); err != nil {
+			return fmt.Errorf("failed to update pool: %w", err)
+		}
+
+		// Update LP token total supply in token registry (burn tokens)
+		lpToken, exists := tokenRegistry.GetToken(pool.LPTokenID)
+		if !exists {
+			return fmt.Errorf("LP token not found: %s", pool.LPTokenID[:16])
+		}
+		lpToken.TotalSupply -= removeData.LPTokens
+		lpToken.LockedShadow -= removeData.LPTokens // Keep accounting consistent
+		if err := tokenRegistry.UpdateToken(lpToken); err != nil {
+			return fmt.Errorf("failed to update LP token supply: %w", err)
+		}
+
+		// Get liquidity provider address from first output
+		var providerAddress Address
+		if len(tx.Outputs) > 0 {
+			providerAddress = tx.Outputs[0].Address
+		} else {
+			return fmt.Errorf("no outputs found for returned tokens")
+		}
+
+		// Create UTXOs for returned tokens A and B
+		tokenAOutput := CreateTokenOutput(providerAddress, amountAToReturn, pool.TokenA, "liquidity_pool", nil)
+		tokenAUTXO := &UTXO{
+			TxID:        txID,
+			OutputIndex: uint32(len(tx.Outputs)),
+			Output:      tokenAOutput,
+			IsSpent:     false,
+		}
+		if err := store.AddUTXO(tokenAUTXO); err != nil {
+			return fmt.Errorf("failed to create token A UTXO: %w", err)
+		}
+
+		tokenBOutput := CreateTokenOutput(providerAddress, amountBToReturn, pool.TokenB, "liquidity_pool", nil)
+		tokenBUTXO := &UTXO{
+			TxID:        txID,
+			OutputIndex: uint32(len(tx.Outputs) + 1),
+			Output:      tokenBOutput,
+			IsSpent:     false,
+		}
+		if err := store.AddUTXO(tokenBUTXO); err != nil {
+			return fmt.Errorf("failed to create token B UTXO: %w", err)
+		}
+
+		fmt.Printf("[LiquidityPool] ✅ Removed liquidity from pool %s: burned %d LP tokens, returned %d/%d tokens\n",
+			removeData.PoolID[:16], removeData.LPTokens, amountAToReturn, amountBToReturn)
+
+	case TxTypeSwap:
+		fmt.Printf("[LiquidityPool] ⏳ START processing swap transaction: %s\n", txID[:16])
+
+		// Parse swap data
+		var swapData SwapData
+		if err := json.Unmarshal(tx.Data, &swapData); err != nil {
+			return fmt.Errorf("failed to parse swap data: %w", err)
+		}
+
+		// Get the pool
+		pool, err := poolRegistry.GetPool(swapData.PoolID)
+		if err != nil {
+			return fmt.Errorf("pool not found: %s", swapData.PoolID[:16])
+		}
+
+		// Determine which token is being swapped
+		var tokenOut string
+		var reserveIn, reserveOut uint64
+
+		if swapData.TokenIn == pool.TokenA {
+			tokenOut = pool.TokenB
+			reserveIn = pool.ReserveA
+			reserveOut = pool.ReserveB
+		} else if swapData.TokenIn == pool.TokenB {
+			tokenOut = pool.TokenA
+			reserveIn = pool.ReserveB
+			reserveOut = pool.ReserveA
+		} else {
+			return fmt.Errorf("token %s not in pool", swapData.TokenIn[:8])
+		}
+
+		// Calculate output amount using constant product formula with fees
+		// amountOut = (amountIn * (10000 - fee) * reserveOut) / ((reserveIn * 10000) + (amountIn * (10000 - fee)))
+		feeMultiplier := uint64(10000 - pool.FeePercent) // e.g., 9970 for 0.3% fee
+		numerator := swapData.AmountIn * feeMultiplier * reserveOut
+		denominator := (reserveIn * 10000) + (swapData.AmountIn * feeMultiplier)
+		amountOut := numerator / denominator
+
+		// Check minimum output (slippage protection)
+		if amountOut < swapData.MinAmountOut {
+			return fmt.Errorf("insufficient output: would receive %d, minimum %d", amountOut, swapData.MinAmountOut)
+		}
+
+		// Update pool reserves
+		if swapData.TokenIn == pool.TokenA {
+			pool.ReserveA += swapData.AmountIn
+			pool.ReserveB -= amountOut
+		} else {
+			pool.ReserveB += swapData.AmountIn
+			pool.ReserveA -= amountOut
+		}
+		pool.K = CalculateK(pool.ReserveA, pool.ReserveB)
+
+		// Update pool in registry
+		if err := poolRegistry.UpdatePool(pool); err != nil {
+			return fmt.Errorf("failed to update pool: %w", err)
+		}
+
+		// Get swapper address from first output
+		var swapperAddress Address
+		if len(tx.Outputs) > 0 {
+			swapperAddress = tx.Outputs[0].Address
+		} else {
+			return fmt.Errorf("no outputs found for swap")
+		}
+
+		// Create UTXO for output tokens
+		outputTokenOutput := CreateTokenOutput(swapperAddress, amountOut, tokenOut, "swap", nil)
+		outputUTXO := &UTXO{
+			TxID:        txID,
+			OutputIndex: uint32(len(tx.Outputs)),
+			Output:      outputTokenOutput,
+			IsSpent:     false,
+		}
+		if err := store.AddUTXO(outputUTXO); err != nil {
+			return fmt.Errorf("failed to create output UTXO: %w", err)
+		}
+
+		fmt.Printf("[LiquidityPool] ✅ Swapped in pool %s: %d %s -> %d %s\n",
+			swapData.PoolID[:16], swapData.AmountIn, swapData.TokenIn[:8], amountOut, tokenOut[:8])
 	}
 
 	return nil
@@ -452,15 +874,17 @@ func (store *UTXOStore) StoreTransaction(tx *Transaction, height int64) error {
 		key := fmt.Sprintf("%s%s:%d", UTXOPrefix, input.PrevTxID, input.OutputIndex)
 
 		// Check cache first
-		utxo, exists := store.cache[key]
-		if !exists {
+		var utxo *UTXO
+		if cached, exists := store.cache.Load(key); exists {
+			utxo = cached.(*UTXO)
+		} else {
 			// Check database directly (no nested lock)
 			data, err := store.db.Get([]byte(key))
 			if err == nil && data != nil {
 				var u UTXO
 				if err := json.Unmarshal(data, &u); err == nil {
 					utxo = &u
-					store.cache[key] = utxo
+					store.cache.Store(key, utxo)
 				}
 			}
 		}

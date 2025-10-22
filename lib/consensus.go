@@ -532,6 +532,11 @@ func (ce *ConsensusEngine) farmingLoop() {
 	ticker := time.NewTicker(2 * time.Second) // Check every 2 seconds
 	defer ticker.Stop()
 
+	// Track last height change for stall detection
+	var lastHeight uint64
+	var lastHeightChangeTime time.Time = time.Now()
+	stallWarningInterval := 30 * time.Second
+
 	for {
 		select {
 		case <-ce.ctx.Done():
@@ -540,6 +545,17 @@ func (ce *ConsensusEngine) farmingLoop() {
 			// Get current challenge
 			challenge := ce.chain.GetCurrentChallenge()
 			currentHeight := ce.chain.GetHeight() + 1
+
+			// Check for stalled block production
+			if currentHeight != lastHeight {
+				lastHeight = currentHeight
+				lastHeightChangeTime = time.Now()
+			} else if time.Since(lastHeightChangeTime) > stallWarningInterval {
+				fmt.Printf("⚠️  [WARNING] Block production stalled! Height %d for %v (mempool: %d txs)\n",
+					currentHeight-1, time.Since(lastHeightChangeTime).Round(time.Second),
+					len(ce.mempool.GetTransactions()))
+				lastHeightChangeTime = time.Now() // Reset to avoid spam
+			}
 
 			// Check if we already have plots loaded
 			if GetPlotCount() == 0 {

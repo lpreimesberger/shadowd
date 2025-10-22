@@ -228,14 +228,17 @@ func (c *BlockSyncClient) SyncFromPeer(peerID peer.ID) error {
 			// Check if we already have this block (could have arrived via consensus during sync)
 			currentHeight := c.chain.GetHeight() - 1 // Convert to block index
 			if block.Index <= currentHeight {
-				fmt.Printf("[Sync] Skipping block %d (already have it)\n", block.Index)
 				continue
 			}
 
 			if err := c.chain.AddBlock(block, nil); err != nil {
 				return fmt.Errorf("failed to add block %d: %w", block.Index, err)
 			}
-			fmt.Printf("[Sync] Added block %d (hash: %s)\n", block.Index, block.Hash[:16])
+
+			// Only log every 100 blocks during sync
+			if block.Index%100 == 0 {
+				fmt.Printf("[Sync] Progress: block %d (hash: %s)\n", block.Index, block.Hash[:16])
+			}
 		}
 	}
 

@@ -12,7 +12,8 @@ import (
 )
 
 const (
-	MempoolTopic = "shadowy-mempool"
+	MempoolTopic       = "shadowy-mempool"
+	MaxTransactionSize = 256 * 1024 // 256 KB max per transaction
 )
 
 // MempoolEntry tracks a transaction and its metadata
@@ -143,25 +144,29 @@ func (mp *Mempool) listenForMessages() {
 
 // verifyTransaction checks if a transaction has a valid signature
 func (mp *Mempool) verifyTransaction(tx *Transaction) bool {
+	txID, _ := tx.ID()
+
 	// For coinbase transactions, no signature verification needed
 	if tx.TxType == TxTypeCoinbase {
+		fmt.Printf("[Mempool] Accepting coinbase transaction %s\n", txID[:16])
 		return true
 	}
 
+	fmt.Printf("[Mempool] Verifying transaction %s (type: %s)\n", txID[:16], tx.TxType.String())
+
 	// Check if transaction is signed
 	if len(tx.Signature) == 0 {
-		txID, _ := tx.ID()
-		fmt.Printf("[Mempool] Transaction %s has no signature\n", txID)
+		fmt.Printf("[Mempool] Transaction %s has no signature\n", txID[:16])
 		return false
 	}
 
 	// Verify the signature using existing ValidateTransaction function
 	if err := ValidateTransaction(tx); err != nil {
-		txID, _ := tx.ID()
-		fmt.Printf("[Mempool] Transaction %s failed validation: %v\n", txID, err)
+		fmt.Printf("[Mempool] Transaction %s failed validation: %v\n", txID[:16], err)
 		return false
 	}
 
+	fmt.Printf("[Mempool] Transaction %s validation passed\n", txID[:16])
 	return true
 }
 
@@ -185,7 +190,26 @@ func (mp *Mempool) AddTransaction(tx *Transaction) error {
 		return fmt.Errorf("transaction already in mempool")
 	}
 
+	// Check transaction size limit
 	txSize := mp.estimateTxSize(tx)
+	if txSize > MaxTransactionSize {
+		mp.txLock.Unlock()
+		return fmt.Errorf("transaction too large: %d bytes (max %d KB)", txSize, MaxTransactionSize/1024)
+	}
+
+	// Check for double-spend: reject if any input is already used by pending tx
+	for _, input := range tx.Inputs {
+		inputKey := fmt.Sprintf("%s:%d", input.PrevTxID, input.OutputIndex)
+		for existingTxID, entry := range mp.entries {
+			for _, existingInput := range entry.Tx.Inputs {
+				existingKey := fmt.Sprintf("%s:%d", existingInput.PrevTxID, existingInput.OutputIndex)
+				if inputKey == existingKey {
+					mp.txLock.Unlock()
+					return fmt.Errorf("double-spend detected: input %s already used by pending tx %s", inputKey[:16], existingTxID[:16])
+				}
+			}
+		}
+	}
 	entry := &MempoolEntry{
 		Tx:             tx,
 		AddedAtBlock:   mp.currentHeight,
@@ -295,6 +319,38 @@ func (mp *Mempool) UpdateBlockHeight(height uint64) {
 
 	mp.currentHeight = height
 	mp.cleanupExpiredTransactionsLocked()
+}
+
+// PurgeInvalidTransactions removes transactions with spent inputs
+// Should be called after each block is added
+func (mp *Mempool) PurgeInvalidTransactions(utxoStore *UTXOStore) {
+	mp.txLock.Lock()
+	defer mp.txLock.Unlock()
+
+	beforeCount := len(mp.entries)
+	var invalidTxs []string
+
+	for txID, entry := range mp.entries {
+		// Check if all inputs are still unspent
+		for _, input := range entry.Tx.Inputs {
+			utxo, err := utxoStore.GetUTXO(input.PrevTxID, input.OutputIndex)
+			if err != nil || utxo == nil || utxo.IsSpent {
+				// Input no longer available - transaction is invalid
+				invalidTxs = append(invalidTxs, txID)
+				break
+			}
+		}
+	}
+
+	if len(invalidTxs) > 0 {
+		for _, txID := range invalidTxs {
+			delete(mp.entries, txID)
+		}
+		fmt.Printf("[Mempool] 🧹 Purged %d transactions with spent inputs (%d -> %d remaining)\n",
+			len(invalidTxs), beforeCount, len(mp.entries))
+	} else if beforeCount > 0 {
+		fmt.Printf("[Mempool] 🧹 Checked %d transactions, none invalid\n", beforeCount)
+	}
 }
 
 // cleanupExpiredTransactionsLocked removes transactions older than expiryBlocks
