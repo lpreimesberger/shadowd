@@ -7,3 +7,5 @@ shadowy*
 /data/
 /blockchain/
 .idea
+*.json
+blockchain.*

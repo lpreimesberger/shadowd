@@ -4,7 +4,7 @@ go 1.25
 
 require shadowy/lib v0.0.0
 
-replace github.com/lpreimesberger/plotlib => ../plotlib/
+//replace github.com/lpreimesberger/plotlib => ../plotlib/
 
 require (
 	github.com/benbjohnson/clock v1.3.5 // indirect
