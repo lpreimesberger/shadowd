@@ -2,6 +2,7 @@
 /node_key.json
 /node_id.txt
 *.sh
+*.log
 shadowy*
 /data/
 /blockchain/
