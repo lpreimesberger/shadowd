@@ -13,23 +13,24 @@ import (
 type Block struct {
 	Index         uint64        `json:"index"`
 	Timestamp     int64         `json:"timestamp"`
-	Transactions  []string      `json:"transactions"`  // Transaction IDs
-	Coinbase      *Transaction  `json:"coinbase"`      // Coinbase transaction for block reward
+	Transactions  []string      `json:"transactions"` // Transaction IDs
+	Coinbase      *Transaction  `json:"coinbase"`     // Coinbase transaction for block reward
 	PreviousHash  string        `json:"previous_hash"`
 	Hash          string        `json:"hash"`
-	Proposer      string        `json:"proposer"`      // Node that proposed this block
-	Votes         []string      `json:"votes"`         // Signatures from nodes that approved
-	WinningProof  *ProofOfSpace `json:"winning_proof"` // Proof of space that won this block
+	Proposer      string        `json:"proposer"`                 // Node that proposed this block
+	Votes         []string      `json:"votes"`                    // Signatures from nodes that approved
+	WinningProof  *ProofOfSpace `json:"winning_proof"`            // Proof of space that won this block
 	WinnerAddress *Address      `json:"winner_address,omitempty"` // Address to receive block reward
 }
 
 // Blockchain represents the chain of blocks
 type Blockchain struct {
-	blocks       []*Block
-	store        *BlockStore
-	utxoStore    *UTXOStore
-	poolRegistry *PoolRegistry
-	chainLock    sync.RWMutex
+	blocks            []*Block
+	store             *BlockStore
+	utxoStore         *UTXOStore
+	poolRegistry      *PoolRegistry
+	chainLock         sync.RWMutex
+	proofPruningDepth int // Keep proofs for last N blocks, 0 = keep all
 }
 
 // NewBlockchain creates a new blockchain with a genesis block
@@ -172,6 +173,56 @@ func (bc *Blockchain) GetHeight() uint64 {
 	defer bc.chainLock.RUnlock()
 
 	return uint64(len(bc.blocks))
+}
+
+// SetProofPruningDepth configures proof pruning
+func (bc *Blockchain) SetProofPruningDepth(depth int) {
+	bc.chainLock.Lock()
+	defer bc.chainLock.Unlock()
+	bc.proofPruningDepth = depth
+	if depth == 0 {
+		fmt.Printf("[Chain] Proof pruning disabled (museum mode - keeping all proofs)\n")
+	} else {
+		fmt.Printf("[Chain] Proof pruning enabled: keeping last %d blocks of proofs\n", depth)
+	}
+}
+
+// PruneOldProofs removes proofs from blocks older than proofPruningDepth
+func (bc *Blockchain) PruneOldProofs() error {
+	bc.chainLock.Lock()
+	defer bc.chainLock.Unlock()
+
+	if bc.proofPruningDepth == 0 {
+		return nil // Museum mode - don't prune
+	}
+
+	currentHeight := uint64(len(bc.blocks))
+	if currentHeight <= uint64(bc.proofPruningDepth) {
+		return nil // Not enough blocks yet
+	}
+
+	pruneBeforeHeight := currentHeight - uint64(bc.proofPruningDepth)
+	prunedCount := 0
+
+	for _, block := range bc.blocks {
+		if block.Index < pruneBeforeHeight && block.WinningProof != nil {
+			// Strip the proof but keep the block
+			block.WinningProof = nil
+
+			// Update in database
+			if err := bc.store.SaveBlock(block); err != nil {
+				return fmt.Errorf("failed to save pruned block %d: %w", block.Index, err)
+			}
+			prunedCount++
+		}
+	}
+
+	if prunedCount > 0 {
+		fmt.Printf("[Chain] Pruned proofs from %d blocks (kept last %d blocks)\n",
+			prunedCount, bc.proofPruningDepth)
+	}
+
+	return nil
 }
 
 // ProposeBlock creates a new block proposal
@@ -317,6 +368,15 @@ func (bc *Blockchain) AddBlock(block *Block, mempool *Mempool) error {
 	// Purge mempool transactions with now-spent inputs
 	if mempool != nil {
 		mempool.PurgeInvalidTransactions(bc.utxoStore)
+	}
+
+	// Prune old proofs every 100 blocks to avoid overhead
+	if bc.proofPruningDepth > 0 && block.Index%100 == 0 {
+		go func() {
+			if err := bc.PruneOldProofs(); err != nil {
+				fmt.Printf("[Chain] Warning: Proof pruning failed: %v\n", err)
+			}
+		}()
 	}
 
 	return nil
@@ -583,11 +643,11 @@ type BlockProposal struct {
 
 // BlockVote represents a vote on a proposed block
 type BlockVote struct {
-	BlockHash string `json:"block_hash"`
+	BlockHash  string `json:"block_hash"`
 	BlockIndex uint64 `json:"block_index"`
-	Voter     string `json:"voter"`
-	Vote      bool   `json:"vote"` // true = approve, false = reject
-	Timestamp int64  `json:"timestamp"`
+	Voter      string `json:"voter"`
+	Vote       bool   `json:"vote"` // true = approve, false = reject
+	Timestamp  int64  `json:"timestamp"`
 }
 
 // Marshal block to JSON

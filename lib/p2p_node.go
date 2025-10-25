@@ -52,8 +52,8 @@ func NewP2PBlockchainNode(p2pPort, apiPort int, config *CLIConfig) (*P2PBlockcha
 		return nil, fmt.Errorf("failed to create mempool: %w", err)
 	}
 
-	// Create wallet for this node
-	wallet, err := LoadOrCreateNodeWallet()
+	// Create wallet for this node (with optional encryption)
+	wallet, err := LoadOrCreateNodeWallet(config.WalletPassword)
 	if err != nil {
 		p2p.Close()
 		mempool.Close()
@@ -67,6 +67,9 @@ func NewP2PBlockchainNode(p2pPort, apiPort int, config *CLIConfig) (*P2PBlockcha
 		mempool.Close()
 		return nil, fmt.Errorf("failed to create blockchain: %w", err)
 	}
+
+	// Configure proof pruning
+	chain.SetProofPruningDepth(config.ProofPruningDepth)
 
 	// Setup sync protocol (for serving blocks to others)
 	SetupSyncProtocol(p2p.Host, chain)
@@ -161,6 +164,9 @@ func (n *P2PBlockchainNode) startAPI() {
 	mux.HandleFunc("/api/chain", n.handleGetChain)
 	mux.HandleFunc("/api/chain/height", n.handleGetHeight)
 	mux.HandleFunc("/api/chain/block/", n.handleGetBlock)
+	mux.HandleFunc("/api/blocks", n.handleGetBlocks)                   // Paginated block list
+	mux.HandleFunc("/api/block/hash/", n.handleGetBlockByHash)         // Get block by hash
+	mux.HandleFunc("/api/transaction/", n.handleGetTransactionDetails) // Full transaction details
 
 	// Consensus status
 	mux.HandleFunc("/api/consensus/status", n.handleConsensusStatus)
@@ -178,21 +184,21 @@ func (n *P2PBlockchainNode) startAPI() {
 	// Token endpoints
 	mux.HandleFunc("/api/tokens", n.handleGetTokens)
 	mux.HandleFunc("/api/token/info", n.handleGetTokenInfo)
-	mux.HandleFunc("/api/token/mint", n.requireAuth(n.handleMintToken))       // Protected
-	mux.HandleFunc("/api/token/melt", n.requireAuth(n.handleMeltToken))       // Protected
+	mux.HandleFunc("/api/token/mint", n.requireAuth(n.handleMintToken)) // Protected
+	mux.HandleFunc("/api/token/melt", n.requireAuth(n.handleMeltToken)) // Protected
 
 	// Swap endpoints
-	mux.HandleFunc("/api/swap/offer", n.requireAuth(n.handleCreateOffer))     // Protected
-	mux.HandleFunc("/api/swap/accept", n.requireAuth(n.handleAcceptOffer))    // Protected
-	mux.HandleFunc("/api/swap/cancel", n.requireAuth(n.handleCancelOffer))    // Protected
+	mux.HandleFunc("/api/swap/offer", n.requireAuth(n.handleCreateOffer))  // Protected
+	mux.HandleFunc("/api/swap/accept", n.requireAuth(n.handleAcceptOffer)) // Protected
+	mux.HandleFunc("/api/swap/cancel", n.requireAuth(n.handleCancelOffer)) // Protected
 	mux.HandleFunc("/api/swap/list", n.handleListOffers)
 
 	// Pool endpoints
-	mux.HandleFunc("/api/pool/create", n.requireAuth(n.handleCreatePool))              // Protected
+	mux.HandleFunc("/api/pool/create", n.requireAuth(n.handleCreatePool)) // Protected
 	mux.HandleFunc("/api/pool/list", n.handleListPools)
-	mux.HandleFunc("/api/pool/add_liquidity", n.requireAuth(n.handleAddLiquidity))     // Protected
+	mux.HandleFunc("/api/pool/add_liquidity", n.requireAuth(n.handleAddLiquidity))       // Protected
 	mux.HandleFunc("/api/pool/remove_liquidity", n.requireAuth(n.handleRemoveLiquidity)) // Protected
-	mux.HandleFunc("/api/pool/swap", n.requireAuth(n.handleSwap))                      // Protected
+	mux.HandleFunc("/api/pool/swap", n.requireAuth(n.handleSwap))                        // Protected
 
 	// Mempool management
 	mux.HandleFunc("/api/mempool/cancel", n.requireAuth(n.handleCancelMempoolTx)) // Protected
@@ -317,10 +323,10 @@ func (n *P2PBlockchainNode) handleSendTransaction(w http.ResponseWriter, r *http
 	var req struct {
 		ToAddress string `json:"to_address"`
 		Amount    uint64 `json:"amount"`
-		Token     string `json:"token"`      // Legacy field
-		TokenID   string `json:"token_id"`   // API spec field
-		Fee       uint64 `json:"fee"`        // Optional fee
-		Memo      string `json:"memo"`       // Optional memo
+		Token     string `json:"token"`    // Legacy field
+		TokenID   string `json:"token_id"` // API spec field
+		Fee       uint64 `json:"fee"`      // Optional fee
+		Memo      string `json:"memo"`     // Optional memo
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -583,6 +589,198 @@ func (n *P2PBlockchainNode) handleGetBlock(w http.ResponseWriter, r *http.Reques
 	json.NewEncoder(w).Encode(block)
 }
 
+// handleGetBlocks returns a paginated list of recent blocks
+func (n *P2PBlockchainNode) handleGetBlocks(w http.ResponseWriter, r *http.Request) {
+	// Parse query parameters
+	limitStr := r.URL.Query().Get("limit")
+	offsetStr := r.URL.Query().Get("offset")
+
+	limit := 20 // default
+	offset := 0
+
+	if limitStr != "" {
+		if _, err := fmt.Sscanf(limitStr, "%d", &limit); err != nil {
+			http.Error(w, "Invalid limit parameter", http.StatusBadRequest)
+			return
+		}
+	}
+
+	if offsetStr != "" {
+		if _, err := fmt.Sscanf(offsetStr, "%d", &offset); err != nil {
+			http.Error(w, "Invalid offset parameter", http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Cap limit to prevent abuse
+	if limit > 100 {
+		limit = 100
+	}
+
+	height := n.Chain.GetHeight()
+	blocks := []map[string]interface{}{}
+
+	// Get blocks in reverse order (newest first)
+	start := int(height) - 1 - offset
+	if start < 0 {
+		start = 0
+	}
+
+	count := 0
+	for i := start; i >= 0 && count < limit; i-- {
+		block := n.Chain.GetBlock(uint64(i))
+		if block == nil {
+			continue
+		}
+
+		// Return summary info (not full block with all transactions)
+		blockSummary := map[string]interface{}{
+			"index":     block.Index,
+			"hash":      block.Hash,
+			"prev_hash": block.PreviousHash,
+			"timestamp": block.Timestamp,
+			"tx_count":  len(block.Transactions),
+			"has_proof": block.WinningProof != nil,
+		}
+
+		// Add coinbase reward if present
+		if block.Coinbase != nil && len(block.Coinbase.Outputs) > 0 {
+			blockSummary["reward"] = block.Coinbase.Outputs[0].Amount
+		}
+
+		if block.WinningProof != nil {
+			blockSummary["proof_distance"] = block.WinningProof.Distance
+		}
+
+		blocks = append(blocks, blockSummary)
+		count++
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"height": height,
+		"blocks": blocks,
+		"limit":  limit,
+		"offset": offset,
+		"count":  len(blocks),
+	})
+}
+
+// handleGetBlockByHash returns a specific block by its hash
+func (n *P2PBlockchainNode) handleGetBlockByHash(w http.ResponseWriter, r *http.Request) {
+	// Extract block hash from path
+	hashStr := r.URL.Path[len("/api/block/hash/"):]
+	if hashStr == "" {
+		http.Error(w, "Block hash required", http.StatusBadRequest)
+		return
+	}
+
+	// Search for block with matching hash
+	height := n.Chain.GetHeight()
+	for i := uint64(0); i < height; i++ {
+		block := n.Chain.GetBlock(i)
+		if block != nil && block.Hash == hashStr {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(block)
+			return
+		}
+	}
+
+	http.Error(w, "Block not found", http.StatusNotFound)
+}
+
+// handleGetTransactionDetails returns full details of a transaction by hash
+func (n *P2PBlockchainNode) handleGetTransactionDetails(w http.ResponseWriter, r *http.Request) {
+	// Extract transaction hash from path
+	txHash := r.URL.Path[len("/api/transaction/"):]
+	if txHash == "" {
+		http.Error(w, "Transaction hash required", http.StatusBadRequest)
+		return
+	}
+
+	// Get transaction from UTXO store
+	utxoStore := n.Chain.GetUTXOStore()
+	tx, err := utxoStore.GetTransaction(txHash)
+	if err != nil || tx == nil {
+		http.Error(w, "Transaction not found", http.StatusNotFound)
+		return
+	}
+
+	// Find which block contains this transaction
+	var blockHeight uint64
+	var blockHash string
+	var blockTimestamp int64
+	var confirmations uint64
+
+	height := n.Chain.GetHeight()
+	found := false
+
+	for i := uint64(0); i < height; i++ {
+		block := n.Chain.GetBlock(i)
+		if block == nil {
+			continue
+		}
+
+		// Check if this block contains the transaction
+		for _, txID := range block.Transactions {
+			if txID == txHash {
+				blockHeight = block.Index
+				blockHash = block.Hash
+				blockTimestamp = block.Timestamp
+				confirmations = height - block.Index
+				found = true
+				break
+			}
+		}
+
+		// Also check coinbase
+		if block.Coinbase != nil {
+			coinbaseTxID, _ := block.Coinbase.ID()
+			if coinbaseTxID == txHash {
+				blockHeight = block.Index
+				blockHash = block.Hash
+				blockTimestamp = block.Timestamp
+				confirmations = height - block.Index
+				found = true
+			}
+		}
+
+		if found {
+			break
+		}
+	}
+
+	// Build response with transaction details
+	response := map[string]interface{}{
+		"tx_hash":   txHash,
+		"tx_type":   tx.TxType,
+		"version":   tx.Version,
+		"locktime":  tx.LockTime,
+		"timestamp": tx.Timestamp,
+		"inputs":    tx.Inputs,
+		"outputs":   tx.Outputs,
+	}
+
+	if found {
+		response["block_height"] = blockHeight
+		response["block_hash"] = blockHash
+		response["block_timestamp"] = blockTimestamp
+		response["confirmations"] = confirmations
+		response["confirmed"] = true
+	} else {
+		response["confirmed"] = false
+		response["in_mempool"] = n.Mempool.HasTransaction(txHash)
+	}
+
+	// Add parsed data for special transaction types
+	if len(tx.Data) > 0 {
+		response["data"] = tx.Data
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
 // handleConsensusStatus returns consensus status
 func (n *P2PBlockchainNode) handleConsensusStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -819,12 +1017,12 @@ func (n *P2PBlockchainNode) handleGetTokens(w http.ResponseWriter, r *http.Reque
 			continue
 		}
 		tokenList = append(tokenList, map[string]interface{}{
-			"token_id":     token.TokenID,
-			"ticker":       token.Ticker,
-			"description":  token.Desc,
-			"max_mint":     token.MaxMint,
-			"max_decimals": token.MaxDecimals,
-			"total_supply": token.TotalSupply,
+			"token_id":      token.TokenID,
+			"ticker":        token.Ticker,
+			"description":   token.Desc,
+			"max_mint":      token.MaxMint,
+			"max_decimals":  token.MaxDecimals,
+			"total_supply":  token.TotalSupply,
 			"locked_shadow": token.LockedShadow,
 			"total_melted":  token.TotalMelted,
 			"creator":       token.CreatorAddress.String(),
@@ -856,18 +1054,18 @@ func (n *P2PBlockchainNode) handleGetTokenInfo(w http.ResponseWriter, r *http.Re
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"token_id":      token.TokenID,
-		"ticker":        token.Ticker,
-		"description":   token.Desc,
-		"max_mint":      token.MaxMint,
-		"max_decimals":  token.MaxDecimals,
-		"total_supply":  token.TotalSupply,
-		"locked_shadow": token.LockedShadow,
-		"total_melted":  token.TotalMelted,
-		"creator":       token.CreatorAddress.String(),
-		"creation_time": token.CreationTime,
-		"is_shadow":     token.IsBaseToken(),
-		"fully_melted":  token.IsFullyMelted(),
+		"token_id":         token.TokenID,
+		"ticker":           token.Ticker,
+		"description":      token.Desc,
+		"max_mint":         token.MaxMint,
+		"max_decimals":     token.MaxDecimals,
+		"total_supply":     token.TotalSupply,
+		"locked_shadow":    token.LockedShadow,
+		"total_melted":     token.TotalMelted,
+		"creator":          token.CreatorAddress.String(),
+		"creation_time":    token.CreationTime,
+		"is_shadow":        token.IsBaseToken(),
+		"fully_melted":     token.IsFullyMelted(),
 		"supply_formatted": token.FormatSupply(),
 	})
 }
@@ -1038,8 +1236,8 @@ func (n *P2PBlockchainNode) handleMeltToken(w http.ResponseWriter, r *http.Reque
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":      true,
-		"tx_id":        txID,
+		"success":       true,
+		"tx_id":         txID,
 		"melted_amount": meltAmount,
 		"message":       fmt.Sprintf("Melted %d tokens", meltAmount),
 	})
@@ -1111,8 +1309,8 @@ func (n *P2PBlockchainNode) handleCreateOffer(w http.ResponseWriter, r *http.Req
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"tx_id":     txID,
-		"status":    "offer_created",
+		"tx_id":      txID,
+		"status":     "offer_created",
 		"expires_at": req.ExpiresAtBlock,
 	})
 }
@@ -1161,8 +1359,8 @@ func (n *P2PBlockchainNode) handleAcceptOffer(w http.ResponseWriter, r *http.Req
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"tx_id":      txID,
-		"status":     "offer_accepted",
+		"tx_id":       txID,
+		"status":      "offer_accepted",
 		"offer_tx_id": req.OfferTxID,
 	})
 }
@@ -1212,8 +1410,8 @@ func (n *P2PBlockchainNode) handleCancelOffer(w http.ResponseWriter, r *http.Req
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"tx_id":      txID,
-		"status":     "offer_cancelled",
+		"tx_id":       txID,
+		"status":      "offer_cancelled",
 		"offer_tx_id": req.OfferTxID,
 	})
 }
@@ -1304,22 +1502,22 @@ func (n *P2PBlockchainNode) handleListOffers(w http.ResponseWriter, r *http.Requ
 
 			// This is an active offer!
 			offers = append(offers, map[string]interface{}{
-				"offer_tx_id":     txID,
-				"have_token_id":   offerData.HaveTokenID,
-				"want_token_id":   offerData.WantTokenID,
-				"have_amount":     offerData.HaveAmount,
-				"want_amount":     offerData.WantAmount,
+				"offer_tx_id":      txID,
+				"have_token_id":    offerData.HaveTokenID,
+				"want_token_id":    offerData.WantTokenID,
+				"have_amount":      offerData.HaveAmount,
+				"want_amount":      offerData.WantAmount,
 				"expires_at_block": offerData.ExpiresAtBlock,
-				"offer_address":   offerData.OfferAddress.String(),
-				"block_height":    i,
+				"offer_address":    offerData.OfferAddress.String(),
+				"block_height":     i,
 			})
 		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"offers":        offers,
-		"count":         len(offers),
+		"offers":         offers,
+		"count":          len(offers),
 		"current_height": currentHeight,
 	})
 }
@@ -1398,8 +1596,8 @@ func (n *P2PBlockchainNode) handleCreatePool(w http.ResponseWriter, r *http.Requ
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"tx_id":  txID,
-		"status": "pool_creation_submitted",
+		"tx_id":   txID,
+		"status":  "pool_creation_submitted",
 		"pool_id": txID, // Pool ID is the creation transaction ID
 	})
 }
@@ -1428,21 +1626,21 @@ func (n *P2PBlockchainNode) handleListPools(w http.ResponseWriter, r *http.Reque
 		}
 
 		poolInfo := map[string]interface{}{
-			"pool_id":       pool.PoolID,
-			"token_a":       pool.TokenA,
-			"token_a_ticker": "",
-			"token_b":       pool.TokenB,
-			"token_b_ticker": "",
-			"reserve_a":     pool.ReserveA,
-			"reserve_b":     pool.ReserveB,
-			"lp_token_id":   pool.LPTokenID,
+			"pool_id":         pool.PoolID,
+			"token_a":         pool.TokenA,
+			"token_a_ticker":  "",
+			"token_b":         pool.TokenB,
+			"token_b_ticker":  "",
+			"reserve_a":       pool.ReserveA,
+			"reserve_b":       pool.ReserveB,
+			"lp_token_id":     pool.LPTokenID,
 			"lp_token_ticker": "",
 			"lp_token_supply": pool.LPTokenSupply,
-			"fee_percent":   pool.FeePercent,
-			"k":             pool.K,
-			"rate_a_to_b":   rateAtoB,
-			"rate_b_to_a":   rateBtoA,
-			"created_at":    pool.CreatedAt,
+			"fee_percent":     pool.FeePercent,
+			"k":               pool.K,
+			"rate_a_to_b":     rateAtoB,
+			"rate_b_to_a":     rateBtoA,
+			"created_at":      pool.CreatedAt,
 		}
 
 		if tokenA != nil {

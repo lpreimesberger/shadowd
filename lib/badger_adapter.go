@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/dgraph-io/badger/v4"
+	"github.com/dgraph-io/badger/v4/options"
 )
 
 // BadgerDBAdapter wraps BadgerDB to implement a simple KV interface compatible with CometBFT-DB
@@ -69,8 +70,12 @@ func NewBadgerDBAdapter(dbPath string) (*BadgerDBAdapter, error) {
 
 	// Database lock options to prevent deadlocks
 	opts.BypassLockGuard = false // Keep lock guard for safety
-	opts.DetectConflicts = false  // Disable conflict detection for faster txns
-	opts.NumVersionsToKeep = 1    // Keep only latest version
+	opts.DetectConflicts = false // Disable conflict detection for faster txns
+	opts.NumVersionsToKeep = 1   // Keep only latest version
+
+	// Enable compression to reduce storage (JSON blocks compress well)
+	opts.Compression = options.ZSTD
+	opts.ZSTDCompressionLevel = 3 // Balance between speed and compression (1-3 recommended)
 
 	// Open the database
 	fmt.Printf("[BadgerDB] Calling badger.Open()...\n")

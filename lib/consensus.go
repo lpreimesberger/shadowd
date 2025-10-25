@@ -15,9 +15,14 @@ import (
 const (
 	ConsensusTopic   = "shadowy-consensus"
 	ProofTopic       = "shadowy-proofs" // New topic for proof competition
-	BlockInterval    = 10 * time.Second // Propose new block every 10 seconds
-	ProofWindow      = 8 * time.Second  // Time window to collect proofs before block proposal
+	BlockInterval    = 60 * time.Second // Propose new block every 60 seconds
+	ProofWindow      = 50 * time.Second // Time window to collect proofs before block proposal
 	MinVoteThreshold = 0.5              // Need >50% of nodes to vote yes
+
+	// Block reward parameters (Bitcoin-style economics)
+	InitialBlockReward = 5_000_000_000 // 50 SHADOW initial reward
+	HalvingInterval    = 210_000       // Halve reward every 210,000 blocks
+	MaxSupply          = 21_000_000    // 21 million SHADOW total (before decimals)
 )
 
 // ConsensusMessage types
@@ -267,7 +272,10 @@ func (ce *ConsensusEngine) proposeBlock() {
 	}
 
 	// Create coinbase transaction - reward goes to proof WINNER not proposer!
-	blockReward := uint64(50_000_000) // 50 SHADOW base reward
+	// Calculate block reward with halving (Bitcoin-style)
+	blockHeight := ce.chain.GetHeight()
+	blockReward := calculateBlockReward(blockHeight)
+
 	coinbaseTx := NewTxBuilder(TxTypeCoinbase)
 	coinbaseTx.SetTimestamp(time.Now().Unix())
 	coinbaseTx.AddOutput(bestProof.RewardAddress, blockReward+totalFees, "SHADOW")
@@ -695,4 +703,24 @@ func (ce *ConsensusEngine) Close() error {
 	ce.proofSub.Cancel()
 	ce.topic.Close()
 	return ce.proofTopic.Close()
+}
+
+// calculateBlockReward calculates the block reward with halving (Bitcoin-style)
+// Reward halves every 210,000 blocks until it reaches zero
+func calculateBlockReward(blockHeight uint64) uint64 {
+	// Calculate number of halvings that have occurred
+	halvings := blockHeight / HalvingInterval
+
+	// After 64 halvings (or ~13.44M blocks), reward becomes 0
+	if halvings >= 64 {
+		return 0
+	}
+
+	// Calculate reward: initial_reward / (2^halvings)
+	reward := uint64(InitialBlockReward)
+	for i := uint64(0); i < halvings; i++ {
+		reward = reward / 2
+	}
+
+	return reward
 }

@@ -1,22 +1,33 @@
 package lib
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa87"
+	"golang.org/x/crypto/pbkdf2"
 )
 
 // WalletData represents the JSON structure saved to disk
 type WalletData struct {
 	Address    string `json:"address"`
 	PublicKey  string `json:"public_key"`  // Base64 encoded
-	PrivateKey string `json:"private_key"` // Base64 encoded
+	PrivateKey string `json:"private_key"` // Base64 encoded (encrypted if Encrypted=true)
 	Created    int64  `json:"created"`     // Unix timestamp
-	Version    int    `json:"version"`     // Wallet format version
+	Version    int    `json:"version"`     // Wallet format version (1=plaintext, 2=encrypted)
+
+	// Encryption fields (version 2 only)
+	Encrypted bool   `json:"encrypted,omitempty"` // True if private key is encrypted
+	Salt      string `json:"salt,omitempty"`      // Base64 encoded salt for PBKDF2 (32 bytes)
+	Nonce     string `json:"nonce,omitempty"`     // Base64 encoded GCM nonce (12 bytes)
 }
 
 // NodeWallet represents the active wallet for a blockchain node
@@ -42,8 +53,78 @@ func DefaultWalletPath() (string, error) {
 	return walletPath, nil
 }
 
+// deriveEncryptionKey derives an AES-256 key from a passphrase using PBKDF2
+// Uses 600,000 iterations (OWASP recommendation as of 2023)
+func deriveEncryptionKey(passphrase string, salt []byte) []byte {
+	return pbkdf2.Key([]byte(passphrase), salt, 600000, 32, sha256.New)
+}
+
+// encryptPrivateKey encrypts a private key using AES-256-GCM
+// Returns: (ciphertext, salt, nonce, error)
+func encryptPrivateKey(privateKeyBytes []byte, passphrase string) ([]byte, []byte, []byte, error) {
+	// Generate random salt (32 bytes)
+	salt := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to generate salt: %w", err)
+	}
+
+	// Derive encryption key from passphrase
+	key := deriveEncryptionKey(passphrase, salt)
+
+	// Create AES-256 cipher
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to create cipher: %w", err)
+	}
+
+	// Create GCM mode
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to create GCM: %w", err)
+	}
+
+	// Generate random nonce (12 bytes for GCM)
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to generate nonce: %w", err)
+	}
+
+	// Encrypt the private key
+	ciphertext := gcm.Seal(nil, nonce, privateKeyBytes, nil)
+
+	return ciphertext, salt, nonce, nil
+}
+
+// decryptPrivateKey decrypts a private key using AES-256-GCM
+func decryptPrivateKey(ciphertext []byte, passphrase string, salt []byte, nonce []byte) ([]byte, error) {
+	// Derive encryption key from passphrase
+	key := deriveEncryptionKey(passphrase, salt)
+
+	// Create AES-256 cipher
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cipher: %w", err)
+	}
+
+	// Create GCM mode
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GCM: %w", err)
+	}
+
+	// Decrypt the private key
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, fmt.Errorf("decryption failed (wrong password?): %w", err)
+	}
+
+	return plaintext, nil
+}
+
 // CreateWalletData creates a new wallet data structure
-func CreateWalletData() (*WalletData, *KeyPair, error) {
+// If passphrase is non-empty, encrypts the private key (version 2)
+// If passphrase is empty, stores plaintext (version 1, backward compatible)
+func CreateWalletData(passphrase string) (*WalletData, *KeyPair, error) {
 	// Generate new key pair
 	keyPair, err := GenerateKeyPair()
 	if err != nil {
@@ -62,18 +143,36 @@ func CreateWalletData() (*WalletData, *KeyPair, error) {
 	}
 
 	walletData := &WalletData{
-		Address:    keyPair.Address().String(),
-		PublicKey:  base64.StdEncoding.EncodeToString(publicKeyBytes),
-		PrivateKey: base64.StdEncoding.EncodeToString(privateKeyBytes),
-		Created:    GetCurrentTimestamp(),
-		Version:    1,
+		Address:   keyPair.Address().String(),
+		PublicKey: base64.StdEncoding.EncodeToString(publicKeyBytes),
+		Created:   GetCurrentTimestamp(),
+	}
+
+	// Encrypt private key if passphrase provided
+	if passphrase != "" {
+		ciphertext, salt, nonce, err := encryptPrivateKey(privateKeyBytes, passphrase)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to encrypt private key: %w", err)
+		}
+
+		walletData.PrivateKey = base64.StdEncoding.EncodeToString(ciphertext)
+		walletData.Salt = base64.StdEncoding.EncodeToString(salt)
+		walletData.Nonce = base64.StdEncoding.EncodeToString(nonce)
+		walletData.Encrypted = true
+		walletData.Version = 2
+	} else {
+		// Plaintext wallet (v1)
+		walletData.PrivateKey = base64.StdEncoding.EncodeToString(privateKeyBytes)
+		walletData.Version = 1
 	}
 
 	return walletData, keyPair, nil
 }
 
 // LoadWalletData loads wallet data from a JSON file
-func LoadWalletData(path string) (*WalletData, *KeyPair, error) {
+// For encrypted wallets (v2), passphrase must be provided
+// For plaintext wallets (v1), passphrase is ignored
+func LoadWalletData(path string, passphrase string) (*WalletData, *KeyPair, error) {
 	// Read file
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -87,19 +186,52 @@ func LoadWalletData(path string) (*WalletData, *KeyPair, error) {
 	}
 
 	// Validate version
-	if walletData.Version != 1 {
+	if walletData.Version != 1 && walletData.Version != 2 {
 		return nil, nil, fmt.Errorf("unsupported wallet version: %d", walletData.Version)
 	}
 
-	// Decode keys from base64
+	// Decode public key from base64
 	publicKeyBytes, err := base64.StdEncoding.DecodeString(walletData.PublicKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to decode public key: %w", err)
 	}
 
-	privateKeyBytes, err := base64.StdEncoding.DecodeString(walletData.PrivateKey)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to decode private key: %w", err)
+	// Decode private key (encrypted or plaintext)
+	var privateKeyBytes []byte
+
+	if walletData.Version == 2 && walletData.Encrypted {
+		// Encrypted wallet - need passphrase
+		if passphrase == "" {
+			return nil, nil, fmt.Errorf("wallet is encrypted but no passphrase provided")
+		}
+
+		// Decode ciphertext, salt, and nonce
+		ciphertext, err := base64.StdEncoding.DecodeString(walletData.PrivateKey)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to decode encrypted private key: %w", err)
+		}
+
+		salt, err := base64.StdEncoding.DecodeString(walletData.Salt)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to decode salt: %w", err)
+		}
+
+		nonce, err := base64.StdEncoding.DecodeString(walletData.Nonce)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to decode nonce: %w", err)
+		}
+
+		// Decrypt private key
+		privateKeyBytes, err = decryptPrivateKey(ciphertext, passphrase, salt, nonce)
+		if err != nil {
+			return nil, nil, err // Error already has context
+		}
+	} else {
+		// Plaintext wallet (v1) or unencrypted v2
+		privateKeyBytes, err = base64.StdEncoding.DecodeString(walletData.PrivateKey)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to decode private key: %w", err)
+		}
 	}
 
 	// Reconstruct key pair
@@ -161,7 +293,8 @@ func SaveWalletData(walletData *WalletData, path string) error {
 }
 
 // LoadOrCreateNodeWallet loads wallet from ~/.sn/default.json or creates it if missing
-func LoadOrCreateNodeWallet() (*NodeWallet, error) {
+// passphrase is used for encrypted wallets (v2). Empty string = plaintext wallet (v1)
+func LoadOrCreateNodeWallet(passphrase string) (*NodeWallet, error) {
 	walletPath, err := DefaultWalletPath()
 	if err != nil {
 		return nil, fmt.Errorf("failed to determine wallet path: %w", err)
@@ -173,14 +306,18 @@ func LoadOrCreateNodeWallet() (*NodeWallet, error) {
 	// Try to load existing wallet
 	if _, err := os.Stat(walletPath); err == nil {
 		// Wallet exists, load it
-		walletData, keyPair, err = LoadWalletData(walletPath)
+		walletData, keyPair, err = LoadWalletData(walletPath, passphrase)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load existing wallet: %w", err)
 		}
-		fmt.Printf("🔑 Loaded existing wallet: %s\n", walletData.Address[:16]+"...")
+		if walletData.Encrypted {
+			fmt.Printf("🔑 Loaded existing encrypted wallet: %s\n", walletData.Address[:16]+"...")
+		} else {
+			fmt.Printf("🔑 Loaded existing wallet: %s\n", walletData.Address[:16]+"...")
+		}
 	} else if os.IsNotExist(err) {
 		// Wallet doesn't exist, create it
-		walletData, keyPair, err = CreateWalletData()
+		walletData, keyPair, err = CreateWalletData(passphrase)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create new wallet: %w", err)
 		}
@@ -190,8 +327,14 @@ func LoadOrCreateNodeWallet() (*NodeWallet, error) {
 			return nil, fmt.Errorf("failed to save new wallet: %w", err)
 		}
 
-		fmt.Printf("🆕 Created new wallet: %s\n", walletData.Address[:16]+"...")
-		fmt.Printf("📁 Wallet saved to: %s\n", walletPath)
+		if walletData.Encrypted {
+			fmt.Printf("🆕 Created new encrypted wallet: %s\n", walletData.Address[:16]+"...")
+			fmt.Printf("📁 Wallet saved to: %s\n", walletPath)
+			fmt.Printf("⚠️  IMPORTANT: Store your passphrase securely! It cannot be recovered.\n")
+		} else {
+			fmt.Printf("🆕 Created new wallet: %s\n", walletData.Address[:16]+"...")
+			fmt.Printf("📁 Wallet saved to: %s\n", walletPath)
+		}
 	} else {
 		return nil, fmt.Errorf("failed to check wallet file: %w", err)
 	}
@@ -206,8 +349,9 @@ func LoadOrCreateNodeWallet() (*NodeWallet, error) {
 }
 
 // InitializeGlobalWallet initializes the global node wallet
-func InitializeGlobalWallet() error {
-	wallet, err := LoadOrCreateNodeWallet()
+// passphrase is used for encrypted wallets (v2). Empty string = plaintext wallet (v1)
+func InitializeGlobalWallet(passphrase string) error {
+	wallet, err := LoadOrCreateNodeWallet(passphrase)
 	if err != nil {
 		return fmt.Errorf("failed to initialize global wallet: %w", err)
 	}
@@ -371,25 +515,36 @@ func (nw *NodeWallet) BackupWallet(backupPath string) error {
 
 // GetWalletInfo returns human-readable wallet information
 func (nw *NodeWallet) GetWalletInfo() map[string]interface{} {
-	// Load wallet data for creation time
-	walletData, _, err := LoadWalletData(nw.Path)
-	created := int64(0)
-	if err == nil {
-		created = walletData.Created
+	// Read wallet JSON directly for metadata (no decryption needed)
+	data, err := os.ReadFile(nw.Path)
+	if err != nil {
+		return map[string]interface{}{
+			"address":       nw.Address.String(),
+			"address_short": nw.Address.String()[:16] + "...",
+			"path":          nw.Path,
+			"created":       int64(0),
+			"version":       1,
+			"encrypted":     false,
+		}
 	}
+
+	var walletData WalletData
+	json.Unmarshal(data, &walletData) // Ignore error, use defaults
 
 	return map[string]interface{}{
 		"address":       nw.Address.String(),
 		"address_short": nw.Address.String()[:16] + "...",
 		"path":          nw.Path,
-		"created":       created,
-		"version":       1,
+		"created":       walletData.Created,
+		"version":       walletData.Version,
+		"encrypted":     walletData.Encrypted,
 	}
 }
 
 // ValidateWalletFile validates the integrity of a wallet file
-func ValidateWalletFile(path string) error {
-	_, _, err := LoadWalletData(path)
+// For encrypted wallets, passphrase must be provided
+func ValidateWalletFile(path string, passphrase string) error {
+	_, _, err := LoadWalletData(path, passphrase)
 	return err
 }
 

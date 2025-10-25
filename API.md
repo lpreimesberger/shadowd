@@ -211,6 +211,271 @@ Legacy endpoint that returns placeholder balance information.
 
 ---
 
+## Block Explorer APIs
+
+### Get Recent Blocks (Paginated)
+Returns a paginated list of recent blocks with summary information.
+
+**Endpoint:** `GET /api/blocks`
+
+**Query Parameters:**
+- `limit` (optional): Number of blocks to return. Default: 20. Maximum: 100.
+- `offset` (optional): Number of blocks to skip. Default: 0.
+
+**Example:**
+```bash
+# Get latest 20 blocks
+curl http://localhost:8080/api/blocks
+
+# Get next 20 blocks
+curl "http://localhost:8080/api/blocks?limit=20&offset=20"
+
+# Get 50 blocks
+curl "http://localhost:8080/api/blocks?limit=50"
+```
+
+**Response:**
+```json
+{
+  "height": 4350,
+  "blocks": [
+    {
+      "index": 4349,
+      "hash": "abc123def456...",
+      "prev_hash": "def789abc123...",
+      "timestamp": "2025-10-24T12:34:56Z",
+      "tx_count": 15,
+      "reward": 5000000000,
+      "has_proof": true,
+      "proof_distance": 42
+    },
+    {
+      "index": 4348,
+      "hash": "def789abc123...",
+      "prev_hash": "ghi012jkl345...",
+      "timestamp": "2025-10-24T12:33:56Z",
+      "tx_count": 8,
+      "reward": 5000000000,
+      "has_proof": false
+    }
+  ],
+  "limit": 20,
+  "offset": 0,
+  "count": 20
+}
+```
+
+**Response Fields:**
+- `height`: Current blockchain height
+- `blocks`: Array of block summaries (newest first)
+  - `index`: Block height/index
+  - `hash`: Block hash
+  - `prev_hash`: Previous block hash
+  - `timestamp`: Block timestamp
+  - `tx_count`: Number of transactions in block
+  - `reward`: Coinbase reward amount
+  - `has_proof`: Whether block has proof-of-space (may be pruned)
+  - `proof_distance`: Hamming distance (if proof present)
+- `limit`: Requested limit
+- `offset`: Requested offset
+- `count`: Number of blocks returned
+
+**Notes:**
+- Blocks are returned in reverse chronological order (newest first)
+- This endpoint provides summary information only - use `/api/chain/block/:index` for full block details
+- Useful for building block list pages in explorers
+
+### Get Block by Index
+Returns full details of a specific block by its height/index.
+
+**Endpoint:** `GET /api/chain/block/:index`
+
+**Example:**
+```bash
+curl http://localhost:8080/api/chain/block/4344
+```
+
+**Response:**
+```json
+{
+  "index": 4344,
+  "timestamp": "2025-10-24T12:30:00Z",
+  "prev_hash": "abc123...",
+  "transactions": [
+    "tx_hash_1",
+    "tx_hash_2",
+    "tx_hash_3"
+  ],
+  "coinbase_reward": 5000000000,
+  "coinbase": {
+    "tx_type": 0,
+    "version": 1,
+    "outputs": [{
+      "address": "S...",
+      "amount": 5000000000,
+      "token_id": "SHADOW"
+    }]
+  },
+  "winning_proof": {
+    "challenge_hash": "...",
+    "plot_hash": "...",
+    "plot_public_key": "...",
+    "plot_signature": "...",
+    "distance": 42,
+    "miner_public_key": "...",
+    "miner_signature": "..."
+  },
+  "hash": "def456...",
+  "votes": {
+    "node_id_1": true,
+    "node_id_2": true
+  }
+}
+```
+
+**Notes:**
+- Returns complete block structure including all transactions and proof
+- `winning_proof` may be `null` if block was pruned (check with `/api/status` for pruning depth)
+- `transactions` array contains transaction hashes - use `/api/transaction/:hash` to get details
+
+### Get Block by Hash
+Returns full details of a specific block by its hash.
+
+**Endpoint:** `GET /api/block/hash/:hash`
+
+**Example:**
+```bash
+curl http://localhost:8080/api/block/hash/abc123def456...
+```
+
+**Response:**
+Same as "Get Block by Index" above.
+
+**Notes:**
+- Searches through blockchain to find block with matching hash
+- Returns 404 if hash not found
+- Slower than lookup by index (requires linear search)
+
+### Get Transaction Details
+Returns comprehensive details about a specific transaction including confirmation status.
+
+**Endpoint:** `GET /api/transaction/:hash`
+
+**Example:**
+```bash
+curl http://localhost:8080/api/transaction/abc123def456...
+```
+
+**Response:**
+```json
+{
+  "tx_hash": "abc123def456...",
+  "tx_type": 1,
+  "version": 1,
+  "locktime": 0,
+  "timestamp": "2025-10-24T12:30:00Z",
+  "inputs": [
+    {
+      "prev_tx_id": "def789...",
+      "output_index": 0,
+      "script_sig": "...",
+      "sequence": 4294967295
+    }
+  ],
+  "outputs": [
+    {
+      "address": "SB9c144C9Fed827fF2345678901BcdEF12345678901234567890bCdEf123456b",
+      "amount": 1000000000,
+      "token_id": "SHADOW",
+      "token_type": "native",
+      "script_pub_key": "..."
+    }
+  ],
+  "confirmed": true,
+  "block_height": 4344,
+  "block_hash": "def456...",
+  "block_timestamp": "2025-10-24T12:30:00Z",
+  "confirmations": 6
+}
+```
+
+**Response Fields (Confirmed Transaction):**
+- `tx_hash`: Transaction hash/ID
+- `tx_type`: Transaction type (see Transaction Types section)
+- `version`: Transaction version
+- `locktime`: Lock time (if any)
+- `timestamp`: Transaction creation timestamp
+- `inputs`: Array of transaction inputs
+- `outputs`: Array of transaction outputs
+- `confirmed`: `true` if included in a block
+- `block_height`: Height of block containing transaction
+- `block_hash`: Hash of block containing transaction
+- `block_timestamp`: Timestamp of block
+- `confirmations`: Number of confirmations (current_height - block_height)
+- `data`: Additional data (for special transaction types)
+
+**Response Fields (Unconfirmed Transaction):**
+```json
+{
+  "tx_hash": "abc123def456...",
+  "tx_type": 1,
+  "version": 1,
+  "locktime": 0,
+  "timestamp": "2025-10-24T12:35:00Z",
+  "inputs": [...],
+  "outputs": [...],
+  "confirmed": false,
+  "in_mempool": true
+}
+```
+
+**Notes:**
+- Searches both confirmed blocks and mempool
+- Returns 404 if transaction not found anywhere
+- Use `confirmations` field to determine transaction finality (6+ confirmations recommended)
+- Special transaction types (mint, melt, pool operations) include parsed `data` field
+
+### Get Chain Info
+Returns overall blockchain statistics.
+
+**Endpoint:** `GET /api/chain`
+
+**Example:**
+```bash
+curl http://localhost:8080/api/chain
+```
+
+**Response:**
+```json
+{
+  "height": 4350,
+  "blocks": [...]
+}
+```
+
+**Notes:**
+- Returns ALL blocks - use `/api/blocks` for paginated results
+- Primarily for testing/debugging - not recommended for production explorers
+
+### Get Current Height
+Returns just the current blockchain height.
+
+**Endpoint:** `GET /api/chain/height`
+
+**Example:**
+```bash
+curl http://localhost:8080/api/chain/height
+```
+
+**Response:**
+```json
+{
+  "height": 4350
+}
+```
+
+---
+
 ## UTXO and Balance Queries
 
 ### Get Mempool Transactions

@@ -269,6 +269,15 @@ func (mp *Mempool) GetTransaction(txID string) (*Transaction, bool) {
 	return entry.Tx, true
 }
 
+// HasTransaction checks if a transaction exists in the mempool
+func (mp *Mempool) HasTransaction(txID string) bool {
+	mp.txLock.RLock()
+	defer mp.txLock.RUnlock()
+
+	_, exists := mp.entries[txID]
+	return exists
+}
+
 // RemoveTransaction removes a transaction from the mempool (e.g., after including in block)
 func (mp *Mempool) RemoveTransaction(txID string) {
 	mp.txLock.Lock()

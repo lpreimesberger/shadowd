@@ -13,16 +13,26 @@ import (
 
 // CLIConfig holds the parsed command line configuration
 type CLIConfig struct {
-	Quiet                 bool     `mapstructure:"quiet" json:"quiet"`                                       // Suppress verbose output (especially Tendermint debug info)
-	Seeds                 []string `mapstructure:"seeds" json:"seeds"`                                       // List of seed nodes in format nodeid@ip_address
+	Quiet                 bool     `mapstructure:"quiet" json:"quiet"`                                       // Suppress verbose output
+	Seeds                 []string `mapstructure:"seeds" json:"seeds"`                                       // List of seed nodes in libp2p multiaddr format
 	Dirs                  []string `mapstructure:"dirs" json:"dirs"`                                         // Directories containing plot/proof files
-	NodeMode              bool     `mapstructure:"node_mode" json:"node_mode"`                               // Run in node mode (HTTP server + console)
-	BlockchainDir         string   `mapstructure:"blockchain_dir" json:"blockchain_dir"`                     // Directory for blockchain data (Tendermint files)
+	NodeMode              bool     `mapstructure:"node_mode" json:"node_mode"`                               // Run in node mode (P2P + consensus + API)
+	BlockchainDir         string   `mapstructure:"blockchain_dir" json:"blockchain_dir"`                     // Directory for blockchain data storage
 	P2PPort               int      `mapstructure:"p2p_port" json:"p2p_port"`                                 // P2P listen port
 	APIPort               int      `mapstructure:"api_port" json:"api_port"`                                 // API/HTTP listen port
 	MempoolTxExpiryBlocks int      `mapstructure:"mempool_tx_expiry_blocks" json:"mempool_tx_expiry_blocks"` // Blocks before tx expires from mempool (default: 2048)
 	MempoolMaxSizeMB      int      `mapstructure:"mempool_max_size_mb" json:"mempool_max_size_mb"`           // Maximum mempool size in MB (default: 300)
 	APIKey                string   `mapstructure:"api_key" json:"api_key"`                                   // Optional API key for write endpoints (env: SHADOWY_API_KEY)
+	ProofPruningDepth     int      `mapstructure:"proof_pruning_depth" json:"proof_pruning_depth"`           // Keep proofs for last N blocks, 0 = keep all (museum mode), default: 10000
+
+	// Plot generation mode
+	PlotMode    bool   `mapstructure:"plot_mode" json:"plot_mode"`       // Generate plot file instead of running node
+	PlotKValue  int    `mapstructure:"plot_k" json:"plot_k"`             // K value for plot (keys in thousands)
+	PlotDir     string `mapstructure:"plot_dir" json:"plot_dir"`         // Output directory for plot file
+	PlotVerbose bool   `mapstructure:"plot_verbose" json:"plot_verbose"` // Verbose output during plotting
+
+	// Wallet encryption
+	WalletPassword string `mapstructure:"wallet_password" json:"-"` // Wallet encryption passphrase (not saved to config, env: SHADOWY_WALLET_PASSWORD)
 }
 
 // SeedNode represents a parsed seed node
@@ -55,7 +65,7 @@ func ParseCLI() (*CLIConfig, error) {
 
 	// Set defaults
 	viper.SetDefault("quiet", false)
-	viper.SetDefault("seeds", []string{})
+	viper.SetDefault("seeds", []string{"/dns4/catgirlcasino.com/tcp/9000/p2p/bootstrap-node-id"}) // Default bootstrap node
 	viper.SetDefault("dirs", []string{})
 	viper.SetDefault("node_mode", false)
 	viper.SetDefault("blockchain_dir", "./blockchain")
@@ -63,17 +73,28 @@ func ParseCLI() (*CLIConfig, error) {
 	viper.SetDefault("api_port", 8080)
 	viper.SetDefault("mempool_tx_expiry_blocks", 2048)
 	viper.SetDefault("mempool_max_size_mb", 300)
-	viper.SetDefault("api_key", "") // No API key by default
+	viper.SetDefault("api_key", "")                // No API key by default
+	viper.SetDefault("proof_pruning_depth", 10000) // Keep last 10k blocks of proofs by default
 
 	// Define command line flags
-	quietFlag := flag.Bool("quiet", false, "Suppress verbose output (especially Tendermint debug info)")
-	seedsFlag := flag.String("seeds", "", "Comma-delimited list of seed nodes (format: nodeid@ip_address[:port])")
-	dirsFlag := flag.String("dirs", "", "Comma-delimited list of directories containing plot/proof files")
-	nodeFlag := flag.Bool("node", false, "Run in node mode (starts HTTP server, Tendermint, and interactive console)")
-	blockchainDirFlag := flag.String("blockchain-dir", "", "Directory for blockchain data (Tendermint files), defaults to ./blockchain")
+	quietFlag := flag.Bool("quiet", false, "Suppress verbose output")
+	seedsFlag := flag.String("seeds", "", "Comma-delimited list of bootstrap seed nodes (libp2p multiaddr format)")
+	dirsFlag := flag.String("dirs", "", "Comma-delimited list of directories containing plot/proof files for farming")
+	nodeFlag := flag.Bool("node", false, "Run in node mode (starts P2P networking, consensus, and HTTP API server)")
+	blockchainDirFlag := flag.String("blockchain-dir", "", "Directory for blockchain data storage, defaults to ./blockchain")
 	p2pPortFlag := flag.Int("p2p-port", 9000, "P2P listen port (default: 9000)")
 	apiPortFlag := flag.Int("api-port", 8080, "API/HTTP listen port (default: 8080)")
 	apiKeyFlag := flag.String("api-key", "", "API key for write endpoints (or set SHADOWY_API_KEY env var)")
+	proofPruningDepthFlag := flag.Int("proof-pruning-depth", 10000, "Keep proofs for last N blocks (0 = museum mode, keep all)")
+
+	// Plot generation flags
+	plotFlag := flag.Bool("plot", false, "Generate a new plot file for farming")
+	plotKValueFlag := flag.Int("plot-k", 1000, "K value for plot generation (number of keys in thousands, default: 1000)")
+	plotDirFlag := flag.String("plot-dir", "./plots", "Output directory for generated plot file (default: ./plots)")
+	plotVerboseFlag := flag.Bool("plot-verbose", false, "Enable verbose output during plot generation")
+
+	// Wallet encryption flag
+	walletPasswordFlag := flag.String("wallet-password", "", "Wallet encryption passphrase (or set SHADOWY_WALLET_PASSWORD env var)")
 
 	// Parse command line
 	flag.Parse()
@@ -132,10 +153,33 @@ func ParseCLI() (*CLIConfig, error) {
 		viper.Set("api_key", *apiKeyFlag)
 	}
 
+	if *proofPruningDepthFlag != 10000 {
+		viper.Set("proof_pruning_depth", *proofPruningDepthFlag)
+	}
+
+	// Wallet password from flag or environment variable
+	walletPassword := *walletPasswordFlag
+	if walletPassword == "" {
+		walletPassword = os.Getenv("SHADOWY_WALLET_PASSWORD")
+	}
+
+	// Check if plot mode was requested (early return, don't need full node config)
+	if *plotFlag {
+		return &CLIConfig{
+			PlotMode:    true,
+			PlotKValue:  *plotKValueFlag,
+			PlotDir:     *plotDirFlag,
+			PlotVerbose: *plotVerboseFlag,
+		}, nil
+	}
+
 	// Unmarshal config into struct
 	if err := viper.Unmarshal(config); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
+
+	// Set wallet password (not persisted to config file)
+	config.WalletPassword = walletPassword
 
 	return config, nil
 }
@@ -144,26 +188,39 @@ func ParseCLI() (*CLIConfig, error) {
 func createDefaultConfig() error {
 	defaultConfig := &CLIConfig{
 		Quiet:                 false,
-		Seeds:                 []string{},
+		Seeds:                 []string{"/dns4/catgirlcasino.com/tcp/9000/p2p/bootstrap-node-id"},
 		Dirs:                  []string{"./plots"},
 		NodeMode:              false,
 		BlockchainDir:         "./blockchain",
+		P2PPort:               9000,
+		APIPort:               8080,
 		MempoolTxExpiryBlocks: 2048,
 		MempoolMaxSizeMB:      300,
+		APIKey:                "",
+		ProofPruningDepth:     10000,
 	}
 
+	// Set all config values in viper
 	viper.Set("quiet", defaultConfig.Quiet)
 	viper.Set("seeds", defaultConfig.Seeds)
 	viper.Set("dirs", defaultConfig.Dirs)
 	viper.Set("node_mode", defaultConfig.NodeMode)
 	viper.Set("blockchain_dir", defaultConfig.BlockchainDir)
+	viper.Set("p2p_port", defaultConfig.P2PPort)
+	viper.Set("api_port", defaultConfig.APIPort)
 	viper.Set("mempool_tx_expiry_blocks", defaultConfig.MempoolTxExpiryBlocks)
 	viper.Set("mempool_max_size_mb", defaultConfig.MempoolMaxSizeMB)
+	viper.Set("api_key", defaultConfig.APIKey)
+	viper.Set("proof_pruning_depth", defaultConfig.ProofPruningDepth)
 
 	// Write config file
 	if err := viper.WriteConfigAs("shadow.json"); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
+
+	fmt.Printf("✅ Created default config file: shadow.json\n")
+	fmt.Printf("   Edit this file to customize your node configuration.\n")
+	fmt.Printf("   Bootstrap seed: catgirlcasino.com (changeable)\n")
 
 	return nil
 }

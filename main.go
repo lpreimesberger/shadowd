@@ -32,6 +32,28 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Check if running in plot generation mode
+	if config.PlotMode {
+		fmt.Printf("📊 Generating plot file...\n")
+		fmt.Printf("   K Value: %d (thousands of keys)\n", config.PlotKValue)
+		fmt.Printf("   Output Directory: %s\n", config.PlotDir)
+		if config.PlotVerbose {
+			fmt.Printf("   Verbose: enabled\n")
+		}
+		fmt.Println()
+
+		err := lib.GeneratePlot(config.PlotDir, uint32(config.PlotKValue), config.PlotVerbose)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error generating plot: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("\n✅ Plot file generated successfully!\n")
+		fmt.Printf("   Location: %s\n", config.PlotDir)
+		fmt.Printf("   Use --dirs %s when running in node mode to use this plot for farming.\n", config.PlotDir)
+		return
+	}
+
 	// Validate configuration
 	if err := config.ValidateConfig(); err != nil {
 		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
@@ -97,7 +119,7 @@ func main() {
 		// Initialize node wallet (loads from ~/.sn/default.json or creates if missing)
 		fmt.Println("\n2. Initializing node wallet...")
 	}
-	err = lib.InitializeGlobalWallet()
+	err = lib.InitializeGlobalWallet("") // Empty passphrase = plaintext wallet
 	if err != nil {
 		log.Fatal("Failed to initialize node wallet:", err)
 	}

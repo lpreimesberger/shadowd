@@ -295,8 +295,8 @@ func TestGlobalWalletManagement(t *testing.T) {
 		return testWalletPath, nil
 	}
 
-	// Initialize global wallet
-	err = InitializeGlobalWallet()
+	// Initialize global wallet (plaintext)
+	err = InitializeGlobalWallet("")
 	if err != nil {
 		t.Fatalf("Failed to initialize global wallet: %v", err)
 	}
